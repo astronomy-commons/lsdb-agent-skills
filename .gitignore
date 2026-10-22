@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# default run locations (CONFIG.md) when a run is started inside the clone
+raw/
+build/
+data.lsdb.io/
+registry.lsdb.io/
+# filled-in site files stay local; only sites/example.env is committed
+skills/*/sites/*.local.env

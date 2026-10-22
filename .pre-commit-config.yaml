@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: portability
+        name: portability check (no local paths, people, hosts, accounts, environments, private sources, dataset names)
+        entry: scripts/check_portability.sh
+        language: script
+        pass_filenames: false
+        always_run: true
