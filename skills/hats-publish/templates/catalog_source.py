@@ -241,13 +241,14 @@ def load_source(cfg, files=None, max_rows: int | None = None):
             type_map = header_types | {c: "str" for c in ecsv_arrays} | type_map
             kw.setdefault("comment", "#")
         for p in paths:
-            frame = pd.read_csv(p, dtype=type_map or None, nrows=max_rows, **kw)
+            want = max(max_rows - sum(len(f) for f in frames), 0) if max_rows else None
+            frame = pd.read_csv(p, dtype=type_map or None, nrows=want, **kw)
             for c, subtype in ecsv_arrays.items():   # array strings -> Arrow-backed list columns
                 if c in frame.columns:
                     parsed = parse_array_strings(frame[c], subtype)
                     frame[c] = pd.array(parsed, dtype=pd.ArrowDtype(parsed.type))   # plain pd.array() would fall back to object
             frames.append(frame)
-            if max_rows:
+            if max_rows and sum(len(f) for f in frames) >= max_rows:
                 break
         df0 = frames[0]
         schema_expect = [(c, _numpy_to_arrow(df0[c].dtype)) for c in df0.columns]

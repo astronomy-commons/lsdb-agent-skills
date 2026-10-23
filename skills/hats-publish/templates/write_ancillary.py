@@ -34,7 +34,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    check_versions, data_files, env_cap, input_files, load_config, read_properties, runlog, writer_kwargs,
+    check_versions, data_files, env_cap, input_files, load_config, read_properties, runlog, parquet_write_kwargs, writer_kwargs,
 )
 
 MAX_IO_THREADS = 32
@@ -104,7 +104,7 @@ def write_thumbnail(catalog_path: Path, cfg, seed: int) -> int:
     thumb = thumb.cast(schema) if thumb.schema != schema else thumb
     thumb = thumb.replace_schema_metadata(schema.metadata)   # keep VOParquet / pandas metadata like the partitions
     out = paths.get_data_thumbnail_pointer(catalog_path)
-    pq.write_table(thumb, out, **writer_kwargs(cfg))
+    pq.write_table(thumb, out, **parquet_write_kwargs(cfg, thumb.schema))
     print(f"thumbnail: {len(thumb):,} rows from {len(files)} partitions -> {out.name}")
     return len(thumb)
 
@@ -118,7 +118,7 @@ def write_stats(catalog_path: Path, cfg) -> None:
     if not target.exists():
         write_per_partition_statistics_from_metadata(catalog_path)
     table = pq.read_table(target)
-    pq.write_table(table, target, **writer_kwargs(cfg))
+    pq.write_table(table, target, **parquet_write_kwargs(cfg, table.schema))
     print(f"per_partition_statistics.parquet: {table.num_rows} rows, re-encoded with the writer settings")
 
 
@@ -182,9 +182,15 @@ def provenance_items(cfg, versions: dict) -> list[str]:
         items.append(f"acknowledgment: {p['obs_ack']}")
     if p.get("obs_copyright"):
         items.append(f"original data terms: {p['obs_copyright']}" + (f" ({p['obs_copyright_url']})" if p.get("obs_copyright_url") else ""))
-    w = writer_kwargs(cfg)
-    items.append(f"parquet writer: {w['compression']} level {w['compression_level']}, page index {'on' if w['write_page_index'] else 'off'}")
+    w = parquet_write_kwargs(cfg, pa.schema([]))
+    items.append(f"parquet writer: {w['compression']} level {w['compression_level']}, page index {'on' if w['write_page_index'] else 'off'}, "
+                 "BYTE_STREAM_SPLIT float columns" + (f", overrides {writer_kwargs(cfg)}" if writer_kwargs(cfg) else ""))
     items.append("built with " + ", ".join(f"{k} {v}" for k, v in versions.items()))
+    pin = Path("templates.pinned/PIN")   # pin_templates.sh, relative to the work directory
+    if pin.exists():
+        kv = dict(line.split("=", 1) for line in pin.read_text().splitlines() if "=" in line)
+        items.append(f"hats-publish templates: lsdb-agent-skills commit {kv.get('commit', 'unknown')[:12]}"
+                     + (" with local changes" if kv.get("dirty") == "yes" else ""))
     if cfg["columns"].get("default"):
         items.append(f"default columns (`hats_cols_default`): {' '.join(cfg['columns']['default'])}")
     return items

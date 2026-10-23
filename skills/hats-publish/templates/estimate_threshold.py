@@ -27,7 +27,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import check_versions, input_files, load_config, pin_cpus, runlog, writer_kwargs  # noqa: E402
+from _common import check_versions, input_files, load_config, pin_cpus, runlog, parquet_write_kwargs  # noqa: E402
 
 MB = 10**6   # file sizes in this script and in [partitioning].target_file_mb
 
@@ -71,7 +71,7 @@ def metadata_estimate(cfg, sample: pa.Table, total_rows: int, threshold: int) ->
         sizes = {}
         for groups in (1, 4):
             out = Path(tmp) / f"rg{groups}.parquet"
-            pq.write_table(sample, out, row_group_size=math.ceil(len(sample) / groups), **writer_kwargs(cfg))
+            pq.write_table(sample, out, **(parquet_write_kwargs(cfg, sample.schema) | {"row_group_size": math.ceil(len(sample) / groups)}))
             sizes[groups] = pq.read_metadata(out).serialized_size
     per_group = max((sizes[4] - sizes[1]) / 3, 1)
     partitions = expected_partitions(total_rows, threshold)
@@ -122,7 +122,7 @@ def main(argv=None) -> int:
     sample = pa.concat_tables(tables)
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "sample.parquet"
-        pq.write_table(sample, out, **writer_kwargs(cfg))
+        pq.write_table(sample, out, **parquet_write_kwargs(cfg, sample.schema))
         on_disk = out.stat().st_size
     bytes_per_row = on_disk / len(sample)
     in_mem = sample.nbytes / len(sample)

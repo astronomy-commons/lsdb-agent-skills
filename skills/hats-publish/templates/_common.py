@@ -103,14 +103,19 @@ def _parse(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
 
 
+FLOOR_VERSION = "0.11.1"
+
+
 def check_versions(cfg: Config, *, need: tuple[str, ...] = REQUIRED_PACKAGES, warn_newer: bool = True) -> dict:
     """Refuse to run below the minimum versions in [versions]; warn if PyPI has a newer release.
 
     The PyPI lookup is skipped with warn_newer=False (the scripts' --no-pypi). Otherwise it makes one connection
     attempt with a 2 s timeout; when that fails (a batch node without outbound network) the remaining packages are
     not looked up."""
-    minimums = {"hats": cfg["versions"].get("hats", "0.11.0"), "lsdb": cfg["versions"].get("lsdb", "0.11.0"),
-                "hats-import": cfg["versions"].get("hats_import", "0.11.0")}
+    # 0.11.1 is a hard floor whatever the config says: older releases write floats with pyarrow's dictionary
+    # encoding (about 1.4x larger files) and lack hats.io.file_io.get_parquet_write_table_kwargs
+    minimums = {pkg: max(cfg["versions"].get(key, FLOOR_VERSION), FLOOR_VERSION, key=_parse)
+                for pkg, key in (("hats", "hats"), ("lsdb", "lsdb"), ("hats-import", "hats_import"))}
     found = {}
     for pkg in need:
         try:
@@ -198,19 +203,33 @@ def require_env(*names: str) -> dict:
 # writer settings and properties
 # ----------------------------------------------------------------------------------------------------------------
 def writer_kwargs(cfg: Config) -> dict:
-    """pyarrow.parquet.write_table keyword arguments from [writer]; also used as hats-import write_table_kwargs."""
+    """Departures from the hats Parquet defaults listed in [writer]; passed as write_table_kwargs to hats-import
+    and lsdb, which merge them over the defaults (empty for a standard run).
+
+    The defaults (hats >= 0.11.1, hats.io.file_io.get_parquet_write_table_kwargs, hats#742) are the team standard:
+    ZSTD level 15, page index, statistics, BYTE_STREAM_SPLIT on every float leaf, DELTA_BINARY_PACKED on
+    _healpix_29 and on an integer leading sort column, dictionary on the rest, 100 000-row row groups."""
     w = cfg["writer"]
-    out = {
-        "compression": w.get("compression", "zstd").upper(),
-        "compression_level": int(w.get("compression_level", 15)),
-        "write_page_index": bool(w.get("write_page_index", True)),
-        "write_statistics": bool(w.get("write_statistics", True)),
-    }
+    if w.get("use_byte_stream_split"):
+        raise SystemExit("[writer].use_byte_stream_split is obsolete: hats >= 0.11.1 writes every float column "
+                         "BYTE_STREAM_SPLIT; remove it (override single columns with [writer].column_encoding)")
+    out = {k: w[k] for k in ("compression", "compression_level", "write_page_index", "write_statistics") if k in w}
+    if "compression_level" in out:
+        out["compression_level"] = int(out["compression_level"])
+    # an empty list would mean "no dictionary on any column" to hats, not "use the defaults"
     if w.get("use_dictionary"):
         out["use_dictionary"] = list(w["use_dictionary"])
-    if w.get("use_byte_stream_split"):
-        out["use_byte_stream_split"] = list(w["use_byte_stream_split"])
+    if w.get("column_encoding"):
+        out["column_encoding"] = dict(w["column_encoding"])
     return out
+
+
+def parquet_write_kwargs(cfg: Config, schema: pa.Schema) -> dict:
+    """Full pyarrow.parquet.write_table keyword arguments for a table the skill writes itself: the hats defaults
+    for this schema with the [writer] overrides, the same settings hats-import uses for the partitions."""
+    from hats.io.file_io.file_io import get_parquet_write_table_kwargs
+
+    return get_parquet_write_table_kwargs(schema, write_table_kwargs=writer_kwargs(cfg))
 
 
 def row_group_kwargs(cfg: Config) -> dict | None:

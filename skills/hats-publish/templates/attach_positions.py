@@ -50,7 +50,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    check_versions, input_files, load_config, pin_cpus, read_properties, runlog, writer_kwargs,
+    check_versions, input_files, load_config, pin_cpus, read_properties, runlog, parquet_write_kwargs,
 )
 from import_collection import file_reader  # noqa: E402
 
@@ -272,7 +272,6 @@ def main(argv=None) -> int:
                          "or fix the reference catalog")
     if not a.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
-    wk = writer_kwargs(cfg)
     rows_in = rows_out = 0
     t0 = time.time()
     def one_file(f):
@@ -299,9 +298,7 @@ def main(argv=None) -> int:
             print(f"dry run: {f.name}: {table.num_rows:,} rows, {missing:,} without a position; would write {out_dir / out_names[f]}")
             print("schema:", [f"{n}: {t}" for n, t in zip(joined.schema.names, joined.schema.types)][:12], "...")
         else:
-            pq.write_table(joined, out_dir / out_names[f], compression=wk["compression"],
-                           compression_level=wk.get("compression_level"), write_page_index=wk.get("write_page_index", True),
-                           write_statistics=wk.get("write_statistics", True))
+            pq.write_table(joined, out_dir / out_names[f], **parquet_write_kwargs(cfg, joined.schema))
         return table.num_rows, joined.num_rows
     with ThreadPoolExecutor(max_workers=a.threads) as ex:
         for n_in, n_out in ex.map(one_file, files):

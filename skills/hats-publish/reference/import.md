@@ -120,10 +120,20 @@ From the arguments: `obs_collection` (the directory name), `dataproduct_type`, `
 
 ## Writer settings
 
-hats-import's documented default is ZSTD level 15. The skill sets the writer explicitly for every table
-(`write_table_kwargs` from `[writer]`): `compression`, `compression_level`, `write_page_index`,
-`write_statistics`, optional dictionary and byte-stream-split column lists. The compression level is not stored in
-Parquet metadata, which is why it is set from configuration and recorded in the README and the run log.
+Use the hats defaults. From hats 0.11.1, hats-import and lsdb write every table with
+`hats.io.file_io.get_parquet_write_table_kwargs` (hats#742): ZSTD level 15, page index, statistics,
+BYTE_STREAM_SPLIT on every float leaf, DELTA_BINARY_PACKED on `_healpix_29` and on an integer leading sort column,
+dictionary on the other columns, 128 KiB data pages, 100 000-row row groups. The skill's own writers (thumbnail,
+statistics, sample files, materialised inputs) call the same function, so every file of a run has the same encoding.
+`[writer]` holds only departures from these defaults (`compression`, `compression_level`, `use_dictionary`,
+`column_encoding`) and is empty for a standard run. The compression level is not stored in Parquet metadata, which is
+why it is recorded in the README and the run log.
+
+The float encoding matters more than the compression level. hats 0.11.0 and older wrote floats with pyarrow's default
+dictionary encoding. Measured on a Legacy Surveys DR11 partition (94 k rows, 233 columns, mostly float): dictionary
+and ZSTD 15 gave 155 MB; BYTE_STREAM_SPLIT and ZSTD 15 gave 111 MB, 29 % smaller. Changing the ZSTD level from 15 to
+3 or 19 changed either result by less than 4 %. The whole DR11 catalog would be about 3 TiB smaller. The encoding sweep
+fails files whose float columns are not BYTE_STREAM_SPLIT.
 
 Cost: on a 4-billion-row catalog ZSTD level 15 was about 96 % of the reducing stage; level 3 was 2.8× faster for
 0.7 % more bytes. The published level stays 15 unless the user decides otherwise; record the choice.

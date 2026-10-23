@@ -19,8 +19,9 @@ policy beyond the note's recommendations, a thumbnail, `partition_info.csv` and 
 identical, `hats_col_healpix` present and first, thumbnail present with the partition schema, VOParquet metadata
 consistent across partitions, margin and index back-pointers resolving, default columns existing, down-sampled
 skymaps present) and the Parquet encoding sweep: every column chunk of every data file uses the configured codec,
-the offset and column indexes are present when `write_page_index` is on, encodings and row-group counts are
-recorded, and the hats version in `hats_builder` matches the installed one. The compression level cannot be read from Parquet metadata, so it is
+the offset and column indexes are present when `write_page_index` is on, every float leaf is BYTE_STREAM_SPLIT and
+`_healpix_29` is DELTA_BINARY_PACKED (the hats >= 0.11.1 defaults, unless `[writer]` overrides them), encodings and
+row-group counts are recorded, and the hats version in `hats_builder` matches the installed one. The compression level cannot be read from Parquet metadata, so it is
 taken from `[writer]` and recorded as provenance; `--spot-check` re-encodes one row group at the configured level
 and compares the size.
 

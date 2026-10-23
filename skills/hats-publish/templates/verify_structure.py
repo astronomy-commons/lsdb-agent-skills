@@ -47,6 +47,7 @@ from _common import (  # noqa: E402
     index_files,
     load_config,
     read_properties,
+    parquet_write_kwargs,
     runlog,
     writer_kwargs,
 )
@@ -343,7 +344,9 @@ def sweep(files: list[Path], label: str, want: dict, res: Results, codec_only: b
     """Check codec/page-index/encodings over files; return a summary dict."""
     want_codec = want["compression"].upper()
     want_index = bool(want.get("write_page_index", True))
-    bad_codec, bad_index, encodings, created_by, row_groups = [], [], set(), set(), []
+    want_enc = want.get("column_encoding") or {}
+    dict_override = set(want["use_dictionary"]) if isinstance(want.get("use_dictionary"), list) else set()
+    bad_codec, bad_index, bad_enc, encodings, created_by, row_groups = [], [], [], set(), set(), []
     for f in files:
         md = pq.read_metadata(f)
         created_by.add(md.created_by)
@@ -363,6 +366,17 @@ def sweep(files: list[Path], label: str, want: dict, res: Results, codec_only: b
                         bad_index.append(f"{f.name}:{cc.path_in_schema}")
                     if not want_index and (cc.has_offset_index or cc.has_column_index):
                         bad_index.append(f"{f.name}:{cc.path_in_schema}")
+                    # hats defaults: BYTE_STREAM_SPLIT on float leaves, DELTA_BINARY_PACKED on _healpix_29; margin and
+                    # index schemas differ from the main one, so the rule is applied by physical type, not by name
+                    path = cc.path_in_schema
+                    expect = want_enc.get(path)
+                    if expect is None and path not in dict_override:
+                        if cc.physical_type in ("FLOAT", "DOUBLE"):
+                            expect = "BYTE_STREAM_SPLIT"
+                        elif path == "_healpix_29":
+                            expect = "DELTA_BINARY_PACKED"
+                    if expect and expect not in cc.encodings:
+                        bad_enc.append(f"{f.name}:{path}={'/'.join(cc.encodings)}")
                 encodings.add(tuple(sorted(cc.encodings)))
     if not files:
         res.warn(f"encoding:{label}", label, "no files")
@@ -373,6 +387,10 @@ def sweep(files: list[Path], label: str, want: dict, res: Results, codec_only: b
         res.check(not bad_index, f"encoding-page-index:{label}", f"{len(files)} files",
                   "offset+column index " + ("present" if want_index else "absent") + " everywhere",
                   f"{len(bad_index)} column chunks without the expected page index: {bad_index[:5]}")
+        res.check(not bad_enc, f"encoding-columns:{label}", f"{len(files)} files",
+                  "float leaves BYTE_STREAM_SPLIT, _healpix_29 DELTA_BINARY_PACKED (hats >= 0.11.1 defaults + [writer])",
+                  f"{len(bad_enc)} column chunks with another encoding (written by hats < 0.11.1 or without the hats "
+                  f"defaults; files are ~1.4x larger): {bad_enc[:5]}")
         res.ok(f"encoding-row-groups:{label}", f"{len(files)} files",
                f"row groups per file min/max {min(row_groups)}/{max(row_groups)}; encodings {sorted(encodings)}")
     res.ok(f"encoding-created-by:{label}", f"{len(files)} files", "; ".join(sorted(created_by)))
@@ -389,8 +407,7 @@ def spot_check_level(files: list[Path], want: dict, res: Results) -> None:
     table = pf.read_row_group(rg_i)
     on_disk = sum(pf.metadata.row_group(rg_i).column(c).total_compressed_size for c in range(pf.metadata.row_group(rg_i).num_columns))
     buf = io.BytesIO()
-    pq.write_table(table, buf, **{k: v for k, v in want.items() if k in ("compression", "compression_level", "write_page_index",
-                                                                         "write_statistics", "use_dictionary", "use_byte_stream_split")})
+    pq.write_table(table, buf, **{k: v for k, v in want.items() if k != "row_group_size"})
     md = pq.read_metadata(io.BytesIO(buf.getvalue()))
     reenc = sum(md.row_group(0).column(c).total_compressed_size for c in range(md.row_group(0).num_columns))
     ratio = reenc / on_disk if on_disk else float("nan")
@@ -475,9 +492,11 @@ def main(argv=None) -> int:
     check_builder_versions(main_props.get("hats_builder", ""), versions.get("hats", ""), main.name, res)
 
     print("== c. Parquet encoding sweep")
-    want = writer_kwargs(cfg)
+    main_files = data_files(main)
+    want = parquet_write_kwargs(cfg, pq.read_schema(main_files[0]) if main_files else pa.schema([]))
     res.ok("encoding-level-provenance", main.name,
            f"writer: {want['compression']} level {want.get('compression_level')} page_index={want.get('write_page_index')} "
+           f"overrides={writer_kwargs(cfg)} "
            "(level is not stored in Parquet metadata; enforced at write time)")
     sweep(data_files(main), main.name, want, res)
     for m in margins:

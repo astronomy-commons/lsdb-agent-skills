@@ -41,7 +41,7 @@ the file.
 | `HATS_PUBLISH_MIRROR_GROUP` | unix group for the copied files | unset = leave as created |
 | **Batch jobs** | | |
 | `HATS_PUBLISH_SBATCH_OPTS` | account, partition and QOS options for `job.sbatch` | required to use the batch route |
-| `HATS_PUBLISH_TEMPLATES` | templates directory when they are not copied next to `catalog.toml` | the submission directory |
+| `HATS_PUBLISH_TEMPLATES` | templates directory that `job.sbatch` pins from when `./templates.pinned` does not exist yet (`pin_templates.sh`); once it exists, every job runs the pinned copy | the submission directory |
 | **Shared-node etiquette** | | |
 | `HATS_PUBLISH_MAX_CPUS` | cap for Dask and `taskset` on shared interactive nodes: the process is pinned to this many physical cores and Dask workers × threads stay within it | unset or empty = no cap |
 | `HATS_PUBLISH_MAX_MEM_GB` | cap for the total Dask worker memory on shared nodes (the import first reduces the worker count, then the per-worker limit, to fit); also the `memwatch.sh` limit for the notebook and comparison steps of a capped `job.sbatch` run; may be fractional | unset or empty = no cap |
@@ -54,7 +54,7 @@ the file.
 | `HATS_PUBLISH_VERIFY_SAMPLE_ROWS` | otherwise the notebook samples this many source rows | `500000` |
 | `HATS_PUBLISH_COMPARE_PIXELS` | partitions of the new build compared with the previous version (`compare_versions.py --sample-pixels`) | `40` |
 | `HATS_PUBLISH_COMPARE_MAX_ROWS` | row budget of that comparison (`--max-rows`) | `5000000` |
-| `HATS_PUBLISH_JOB_SCRIPT` | the job script `resubmit_loop.sh` resubmits | `$HATS_PUBLISH_TEMPLATES/job.sbatch`, else `./job.sbatch` |
+| `HATS_PUBLISH_JOB_SCRIPT` | the job script `resubmit_loop.sh` resubmits | `./templates.pinned/job.sbatch` |
 | `HATS_PUBLISH_MAX_RESUBMITS` | how many times `resubmit_loop.sh` resubmits before giving up | `10` |
 | `HATS_PUBLISH_RUNLOG` | the run-log file the templates append to; the scripts set it to `<work_dir>/runlog.jsonl` themselves | `./runlog.jsonl` |
 | `HATS_PUBLISH_SCRUB_PREFIXES` | colon-separated mount prefixes that `run_log.py render --scrub` replaces with `<site-path>` (home directories, the user name, e-mail addresses and the host name are scrubbed without configuration; `run_log.py selftest` checks it) | none |
@@ -79,9 +79,9 @@ Target keys other than `web` and `mirror` (for example a partner object-storage 
 
 | Package | Minimum | Why |
 |---|---|---|
-| `hats-import` | 0.11.0 | collection builder, verification pipeline |
-| `hats` | 0.11.0 | properties, summary files, pixel math |
-| `lsdb` | 0.11.0 | small route, value-level verification, open tests |
+| `hats-import` | 0.11.1 | collection builder, verification pipeline; writes with the hats Parquet defaults |
+| `hats` | 0.11.1 | properties, summary files, pixel math; Parquet writer defaults (BYTE_STREAM_SPLIT floats) |
+| `lsdb` | 0.11.1 | small route, value-level verification, open tests; writes with the hats Parquet defaults |
 | `pyarrow` | any supported by hats | page index and ZSTD writer options |
 | `astropy` | any current | FITS reading, sky separations |
 | `fitsio` | any current | row-parallel companion FITS files, derived and packed columns, bounded row-range reads in sampled verification |

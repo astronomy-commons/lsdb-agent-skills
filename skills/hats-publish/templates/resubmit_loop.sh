@@ -3,12 +3,12 @@
 #
 # Usage (from the work directory, with the import environment active so `python` is the import's python):
 #   setsid nohup ./resubmit_loop.sh <job id> [sbatch options for resubmits ...] > /dev/null 2>&1 < /dev/null &
-# The job script resubmitted is $HATS_PUBLISH_JOB_SCRIPT, else $HATS_PUBLISH_TEMPLATES/job.sbatch, else ./job.sbatch.
+# The job script resubmitted is $HATS_PUBLISH_JOB_SCRIPT, else ./templates.pinned/job.sbatch.
 # The site file named by $HATS_PUBLISH_SITE_ENV is sourced when set (for $HATS_PUBLISH_SBATCH_OPTS).
 # A resubmit uses, in this order (later options win): $HATS_PUBLISH_SBATCH_OPTS, the original job's resources
 # (CPUs per task, memory, time limit, partition, QOS, account; read once with scontrol, or sacct when the job has
 # already left the controller, and kept in resubmit_opts.txt), the extra options given here, and
-# --export=ALL,HATS_PUBLISH_TEMPLATES=<the job script's directory>.
+# --export=ALL,HATS_PUBLISH_TEMPLATES=<the pinned templates>.
 #
 # Behaviour:
 #   - waits for the job to leave the queue, then reads its final state from sacct;
@@ -26,7 +26,14 @@
 # watched), resubmit_opts.txt, loop.heartbeat (host:pid, rewritten every minute). A second loop refuses to start
 # while the heartbeat is younger than 3 minutes, on any node. Never edit this script while a loop runs (bash reads
 # it as it executes): stop it, edit, restart.
+# The loop runs from ./templates.pinned, the run's frozen copy of the templates (pin_templates.sh, created here when
+# the first job has not created it yet), and resubmits that copy's job.sbatch.
 set -uo pipefail
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ "$SELF" != "$PWD/templates.pinned" ]; then
+  P=$(bash "$SELF/pin_templates.sh") || { echo "pinning the templates failed" >&2; exit 2; }
+  exec bash "$P/resubmit_loop.sh" "$@"
+fi
 job=${1:?usage: resubmit_loop.sh <job id> [sbatch options ...]}
 shift
 EXTRA=("$@")
@@ -42,6 +49,7 @@ load_site_env() {
   eval "$saved"
 }
 load_site_env
+export HATS_PUBLISH_TEMPLATES=$SELF   # the pinned copy, also for resubmits (--export below)
 if [ -n "${HATS_PUBLISH_JOB_SCRIPT:-}" ]; then SCRIPT=$HATS_PUBLISH_JOB_SCRIPT
 elif [ -n "${HATS_PUBLISH_TEMPLATES:-}" ]; then SCRIPT=$HATS_PUBLISH_TEMPLATES/job.sbatch
 else SCRIPT=$W/job.sbatch; fi

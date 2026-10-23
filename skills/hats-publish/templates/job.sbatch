@@ -20,6 +20,9 @@
 # templates were not copied next to catalog.toml; export it (rather than setting it inline) so that resubmit_loop.sh
 # passes it on. On a preemptable QOS the job may be cancelled rather than requeued: run resubmit_loop.sh next to it;
 # a resubmitted job resumes from hats-import's resume logs.
+# Every phase runs from ./templates.pinned, the run's frozen copy of the templates (pin_templates.sh): the first job
+# of a run creates it from $T, later jobs and resubmits reuse it, so a git pull or an edit of the skill during the run
+# does not change the code the run executes. Change the code of a running import only with pin_templates.sh --repin.
 #
 # [run].route = "small" runs import_small.py (lsdb.from_dataframe) instead of import_collection.py (hats-import).
 # HATS_PUBLISH_SKIP_IMPORT=1 runs only the phases after the import (collection already built). A successful import
@@ -33,7 +36,13 @@
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-.}"
 T="${HATS_PUBLISH_TEMPLATES:-${SLURM_SUBMIT_DIR:-.}}"
-[ -f "$T/import_collection.py" ] || { echo "templates not found under $T: set HATS_PUBLISH_TEMPLATES" >&2; exit 2; }
+if [ -f "$PWD/templates.pinned/PIN" ]; then
+  T=$PWD/templates.pinned
+else
+  [ -f "$T/import_collection.py" ] || { echo "templates not found under $T: set HATS_PUBLISH_TEMPLATES" >&2; exit 2; }
+  T=$(bash "$T/pin_templates.sh") || { echo "pinning the templates failed" >&2; exit 2; }
+fi
+echo "templates: $T ($(grep -m1 '^commit=' "$T/PIN" | cut -d= -f2 | cut -c1-12), dirty=$(grep -m1 '^dirty=' "$T/PIN" | cut -d= -f2))"
 # Site defaults: source $HATS_PUBLISH_SITE_ENV when set. A HATS_PUBLISH_* variable already present in the
 # environment keeps its value, even when empty (the same rule as _common.site_env() in the Python templates).
 load_site_env() {

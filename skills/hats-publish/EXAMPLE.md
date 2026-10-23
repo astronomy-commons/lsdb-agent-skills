@@ -13,7 +13,7 @@ export HATS_PUBLISH_RAW_ROOT=/path/to/large/disk/raw HATS_PUBLISH_BUILD_ROOT=/pa
 # 1. work directory and configuration
 mkdir mysurvey-dr1 && cd mysurvey-dr1
 cp $SKILL/templates/catalog.toml .          # work_dir = "." (this directory)
-T=$SKILL/templates
+T=$(bash $SKILL/templates/pin_templates.sh)   # read-only copy in ./templates.pinned; every step below runs it
 #    ... decision interview: fill [run], [source], [columns], [names], [partitioning], [margins], [index],
 #        [properties], [hosting], [site]; record each answer:
 python $T/run_log.py decision partitioning --kv question="target file size" answer="200-800 MB" default="200-800 MB" rationale="docs rule"
@@ -37,7 +37,7 @@ nohup python $T/import_collection.py > import.log 2>&1 &
 python $T/write_ancillary.py
 #    ... or as a batch job that also runs steps 5-6 (needs HATS_PUBLISH_SBATCH_OPTS from the site file):
 #    source "$HATS_PUBLISH_SITE_ENV"      # puts HATS_PUBLISH_SBATCH_OPTS in this shell
-#    export HATS_PUBLISH_TEMPLATES=$T     # exported (not inline), so resubmit_loop.sh passes it on to resubmits
+#    export HATS_PUBLISH_TEMPLATES=$T     # the pinned copy; job.sbatch and resubmit_loop.sh also find ./templates.pinned themselves
 #    sbatch $HATS_PUBLISH_SBATCH_OPTS --cpus-per-task=64 --mem=400G --time=2-00:00:00 $T/job.sbatch
 #    setsid nohup bash $T/resubmit_loop.sh <job id> > /dev/null 2>&1 < /dev/null &   # on a preemptable queue
 

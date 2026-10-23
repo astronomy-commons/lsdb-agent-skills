@@ -113,13 +113,13 @@ t_max = 0.0
 data_ucd = ""
 extra = {}                          # any other key -> value
 
-[writer]                            # the team standard; applied to catalog, margin and index writes
-compression = "zstd"
-compression_level = 15
-write_page_index = true
-write_statistics = true
-use_dictionary = []                 # column names; [] = pyarrow default (dictionary on all)
-use_byte_stream_split = []          # float columns where measured useful
+[writer]                            # overrides of the hats Parquet defaults (hats >= 0.11.1), which are the team standard:
+                                    # ZSTD 15, page index, statistics, BYTE_STREAM_SPLIT floats, DELTA_BINARY_PACKED _healpix_29,
+                                    # dictionary on the rest. Leave the overrides unset for a standard run.
+# compression = "zstd"
+# compression_level = 15
+# use_dictionary = ["COL"]          # only these columns get a dictionary (an empty list is ignored, not "none")
+# column_encoding = { COL = "PLAIN" }  # per-leaf encoding overrides, Parquet path ("A.list.element")
 create_metadata = true              # dataset/_metadata (all row-group footers in one file); false when it would pass Parquet's 4 GiB footer limit (~10^5 row groups x a few hundred columns)
 
 [dask]                              # (interview) see reference/import.md "resources"
@@ -168,6 +168,6 @@ authority = "ivo://data.lsdb/uw"     # IVOID prefix the registry assigns (<autho
 mirrors = []                        # informational: other copies of this catalog, [{ status = "mirror", url = "" }]
 
 [versions]                          # minimum library versions; templates refuse to run below these
-hats = "0.11.0"
-lsdb = "0.11.0"
-hats_import = "0.11.0"
+hats = "0.11.1"
+lsdb = "0.11.1"
+hats_import = "0.11.1"

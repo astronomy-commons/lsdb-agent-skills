@@ -160,7 +160,7 @@ def main(argv=None) -> int:
         wk["row_group_size"] = int(rg.get("value", 200_000))
     elif rg.get("strategy", "subtile_order_delta") == "subtile_order_delta":
         print("note: [partitioning].row_groups subtile_order_delta is not available on the small route; "
-              "files get pyarrow's default row groups")
+              "files get the hats default row groups (100 000 rows)")
     cat.write_catalog(
         out, catalog_name=cfg["names"]["catalog"], as_collection=True, overwrite=a.overwrite,
         default_columns=cols.get("default") or None,

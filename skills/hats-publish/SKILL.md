@@ -16,6 +16,11 @@ One run = one `catalog.toml` (copied from `templates/catalog.toml` into a work d
 it, relative paths in it resolve against the directory holding it, and a run is reproducible from that file alone. Keep the work directory: it holds the config, the logs, the
 executed verification notebook and the run log.
 
+Pin the templates at the start of every run: `T=$(bash <skill>/templates/pin_templates.sh)` in the work directory
+copies them read-only to `templates.pinned/` with the git commit, and every later step (`job.sbatch` and
+`resubmit_loop.sh` included) runs `$T/...`. A git pull or an edit of the skill then cannot change a running import, and
+the README names the commit that built the catalog. Change the code of a run only with `pin_templates.sh --repin`.
+
 ## When to use
 
 A new survey release to publish; a re-import of an existing HATS catalog with better partitioning, writer
@@ -65,9 +70,10 @@ Phases in order. **Bold** steps stop and wait for the user. Each phase starts an
    and 1 GB in memory; above about 100 k rows on wide tables hats-import is faster) use `import_small.py` instead. Then `write_ancillary.py`: data thumbnail (random per-partition sample),
    per-partition statistics, PNG previews, README and `index.html` with a provenance section.
    Progress: `status.sh` (from the work directory) prints the download, the SLURM job, the current hats-import stage
-   with its progress bar, and the latest run-log entry. Downloads and imports run for hours: offer the user updates on
-   a schedule (every 5 minutes unless they say otherwise) that run `status.sh` and report only what changed, and
-   check the job's real state when it leaves the queue. On a preemptable queue start `resubmit_loop.sh <job id>` next
+   with its progress bar, and the latest run-log entry. Downloads and imports run for hours: as soon as one runs in
+   the background (phase 2 or 5), start updates every 5 minutes without asking. Each update runs `status.sh` and
+   reports only what changed. Say that they are running and that the user can change the interval or stop them.
+   Stop them when the job finishes or fails, and check the job's real state when it leaves the queue. On a preemptable queue start `resubmit_loop.sh <job id>` next
    to the job: it records the job's resources in `resubmit_opts.txt`, resubmits preempted or system-cancelled jobs
    with the same resources (hats-import resumes; a job preempted after the import finished, marked by `import.done`,
    is resubmitted with the import skipped) and stops on anything else.
@@ -105,6 +111,7 @@ until the page and registry point to the new one.
 | File | Purpose |
 |---|---|
 | `catalog.toml` | the run configuration (copy and fill) |
+| `pin_templates.sh` | freeze the templates for one run in `templates.pinned/` (commit, local diff, checksums); `--repin` to change them |
 | `_common.py`, `catalog_source.py`, `readers.py` | shared helpers: config, versions, site variables, writer settings, properties, source loader, coordinate filter |
 | `estimate_threshold.py` | file-size rule → `pixel_threshold` |
 | `import_collection.py` | hats-import collection build (`--dry-run`, `--trial-file`) |
@@ -131,7 +138,9 @@ One line each; details and more in `reference/pitfalls.md`.
 - Rows without coordinates stop the mapping stage: trial-import first, filter and count them.
 - Gzipped CSV inputs need `compression="gzip"` (the reader gets an open handle); the import adds it for `.gz` files.
 - `expected_total_rows` must match or the pipeline stops after binning; it is a check, not a hint.
-- Set the writer explicitly (ZSTD 15, page index) on every table; the level cannot be read back from the files.
+- Use the hats Parquet defaults (hats, hats-import, lsdb >= 0.11.1): ZSTD 15, page index, BYTE_STREAM_SPLIT on
+  float columns. Leave `[writer]` empty unless the user decides otherwise; write any file the skill writes itself with
+  `parquet_write_kwargs`. Older versions write floats dictionary-encoded, about 1.4× larger.
 - Default columns must exist in the schema; nested columns use `frame.subcol`.
 - hats writes `hats.properties` and `properties`; edit both or neither.
 - `hats_release_date` is the HATS note's date, not the data's; put data dates in `t_min`/`t_max`.

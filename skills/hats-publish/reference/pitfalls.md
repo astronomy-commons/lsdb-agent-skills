@@ -34,9 +34,10 @@ citeable home.
 | Symptom | Cause | Rule |
 |---|---|---|
 | Files far outside 200–800 MB | threshold set by guess | `estimate_threshold.py`; `byte_pixel_threshold` when rows vary a lot in width (file sizes can still be uneven) |
-| Snappy-compressed or larger-than-expected files after a rewrite | a post-processing script rewrote leaves without the writer settings | always pass the `[writer]` settings; the encoding sweep catches it |
-| No page index on files | the writer defaults differ by tool and version (hats-import#719) | set `write_page_index` explicitly; the sweep checks every file |
-| Compression level unknown | Parquet metadata records the codec only | set the level from `[writer]`, record it in the README and the run log; use `--spot-check` |
+| Snappy-compressed or larger-than-expected files after a rewrite | a post-processing script rewrote leaves without the writer settings | write with `parquet_write_kwargs(cfg, table.schema)` (the hats defaults plus `[writer]`); the encoding sweep catches it |
+| Catalog about 1.4× larger than another build of the same data; float columns encoded `PLAIN/RLE_DICTIONARY` | built with hats or hats-import 0.11.0 or older, which use pyarrow's default dictionary encoding on floats | use hats, hats-import and lsdb 0.11.1 or newer (the templates refuse older versions); `encoding-columns` in the sweep fails such files |
+| No page index on files | the writer defaults differ by tool and version (hats-import#719) | use hats >= 0.11.1 (page index on by default); the sweep checks every file |
+| Compression level unknown | Parquet metadata records the codec only | the README and the run log record it (hats default 15 unless `[writer]` overrides); use `--spot-check` |
 | Row group too large for some engines | single row group per file | `subtile_order_delta` or `num_rows` row groups (see import.md) |
 | Finishing stage fails writing `dataset/_metadata` after the whole import (thrift size limit) | `_metadata` is one Parquet footer that lists every row group of every file; a footer cannot exceed 4 GiB; wide schemas × tens of thousands of partitions × several row groups get there | `estimate_threshold.py` predicts the size; above ~60 % of the limit set `[writer].create_metadata = false` (verification then reads the file footers) or use fewer row groups |
 | About 2.4× more partitions than total rows / threshold | adaptive binning leaves partitions between a quarter of the threshold and the threshold | plan file counts, footers and `_metadata` with the factor (`estimate_threshold.py` uses 2.4) |
@@ -86,6 +87,7 @@ citeable home.
 | A memory watchdog kills a step that belongs to another run on the same node | the watchdog matched processes by command name across the whole user | `memwatch.sh` watches only the descendants of the step's pid (pid file) |
 | Size comparison between copies differs | `du` counts directory entries differently per filesystem | compare file bytes or checksums |
 | A preempted batch job never comes back | on some sites a preemptable QOS cancels the job instead of requeueing it, whatever `--requeue` says; a system or admin cancel shows as `CANCELLED by 0` | run `resubmit_loop.sh` next to the job; hats-import resumes from its done-markers |
+| A long run fails or changes behaviour after a `git pull` of the skill | the run executed the live clone: each template is read when its step starts, and bash reads a running script as it goes | pin the templates per run (`pin_templates.sh`); `job.sbatch` and `resubmit_loop.sh` run `./templates.pinned`; change a running import only with `--repin` |
 | A watcher decides a running job has ended | `squeue` returned nothing for a moment while `sacct` still said RUNNING | treat RUNNING/PENDING from `sacct` as still running (`resubmit_loop.sh` does) |
 | Two resubmit loops run for one import | a loop was started again from another login node or session | `resubmit_loop.sh` refuses to start while `loop.heartbeat` is under 3 minutes old |
 | Editing a running shell loop breaks it | bash reads a script from disk while executing it | stop the loop, edit, restart |
