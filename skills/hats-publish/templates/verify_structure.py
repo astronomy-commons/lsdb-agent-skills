@@ -8,14 +8,25 @@ Three groups of checks, every one PASS / FAIL / WARN with a one-line reason:
   b. HATS-note compliance: required files and properties per table type, both property files identical, property
      vocabularies, spatial-index column present and first, data thumbnail present with the partition schema,
      per-partition statistics present, VOParquet metadata consistent across partitions, margin/index
-     ``hats_primary_table_url`` resolving, default columns existing, down-sampled skymaps present.
+     ``hats_primary_table_url`` resolving, default columns existing, down-sampled skymaps present; then defects
+     found on served catalogs: stray hive-key columns (Norder/Dir/Npix, _hipscat_index, __index_level_*), files
+     that fail a hive-partitioned read, pandas index metadata, float32 coordinates, margin schema and pixel set vs
+     the catalog, default margin declared, point-map order and sum, and on a sample of up to 3 partitions (first,
+     median size, last): duplicate ids, all-null columns, sort order, coordinate ranges and the recomputed
+     ``_healpix_29``.
   c. Parquet encoding sweep over every data partition, margin partition and index part: codec per column chunk,
      page index present, encodings and row-group counts recorded, ``created_by`` recorded, writer level recorded
      as provenance (``--spot-check`` re-encodes one row group at the configured level and compares the size).
 
 Usage:
     verify_structure.py --config catalog.toml [--collection PATH] [--truth-rows N] [--truth-schema PARQUET]
-                        [--results-file PATH] [--spot-check] [--no-pypi]
+                        [--results-file PATH] [--spot-check] [--no-pypi] [--trial]
+
+``--trial`` is for a trial build (``import_collection.py --trial-file``: no margins, indexes or ancillary files): the
+thumbnail, per-partition statistics, alternate skymap orders and the margin/index presence checks become WARN with
+"(trial build)"; every data check (stray columns, coordinates, duplicates, encodings) keeps its full strength.
+The main catalog is the collection's ``hats_primary_table_url`` (``[names].catalog`` only when collection.properties
+is absent), so a trial collection ``trial_<collection>/trial_<catalog>`` is found without extra arguments.
 
 Run it after the import, and again on every copy after publishing (``--collection <copy>``; give that run its own
 ``--results-file`` so the build's results are kept). Exit code 0 only when every check passed (WARN does not fail).
@@ -28,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import logging
 import random
 import re
@@ -35,6 +47,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -60,11 +73,17 @@ REQUIRED_PROPS = {
     "margin": ["dataproduct_type", "obs_collection", "hats_nrows", "hats_margin_threshold", "hats_primary_table_url"],
     "index": ["dataproduct_type", "obs_collection", "hats_nrows", "hats_index_column", "hats_primary_table_url"],
 }
+# hive keys and pandas index columns that pre-0.5 hipscat builds wrote into the files (often all null); with them a
+# hive-partitioned read fails with "Field Norder has incompatible types"
+STRAY_COLUMNS = {"Norder", "Dir", "Npix", "_hipscat_index"}
+MARGIN_PIXEL_COLUMNS = {"margin_Norder", "margin_Dir", "margin_Npix"}
+TRIAL_SUFFIX = " (trial build)"
 
 
 class Results:
-    def __init__(self):
+    def __init__(self, trial: bool = False):
         self.rows: list[dict] = []
+        self.trial = trial   # --trial: checks of files a trial build does not write report WARN instead of FAIL
 
     def add(self, status: str, test: str, target: str, description: str):
         self.rows.append({"datetime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -87,6 +106,19 @@ class Results:
 
     def check(self, cond: bool, test, target, ok_desc="", fail_desc=""):
         (self.ok if cond else self.fail)(test, target, ok_desc if cond else fail_desc)
+
+    def trial_fail(self, test, target, desc=""):
+        """FAIL, or WARN with "(trial build)" under --trial: for files and tables a trial build does not write."""
+        if self.trial:
+            self.warn(test, target, desc + TRIAL_SUFFIX)
+        else:
+            self.fail(test, target, desc)
+
+    def check_trial(self, cond: bool, test, target, ok_desc="", fail_desc=""):
+        if cond:
+            self.ok(test, target, ok_desc)
+        else:
+            self.trial_fail(test, target, fail_desc)
 
     @property
     def failed(self) -> int:
@@ -212,8 +244,19 @@ def check_property_files(table: Path, res: Results) -> dict:
         res.fail("properties-present", table.name, "neither hats.properties nor properties exists")
         return {}
     if a.exists() and b.exists():
-        res.check(a.read_bytes() == b.read_bytes(), "properties-files-identical", table.name,
-                  "hats.properties == properties", "hats.properties and properties differ (edit both)")
+        same = a.read_bytes() == b.read_bytes()
+        drift = ""
+        if not same:
+            pa_, pb_ = read_properties(a), read_properties(b)
+            only_a = sorted(set(pa_) - set(pb_))
+            only_b = sorted(set(pb_) - set(pa_))
+            changed = sorted(k for k in set(pa_) & set(pb_) if pa_[k] != pb_[k])
+            drift = (f"; only in hats.properties: {only_a}" if only_a else "") + \
+                    (f"; only in properties: {only_b}" if only_b else "") + \
+                    (f"; different values: {changed}" if changed else "")
+            drift = drift or "; same keys and values (comments, order or whitespace differ)"
+        res.check(same, "properties-files-identical", table.name,
+                  "hats.properties == properties", "hats.properties and properties differ (edit both)" + drift)
     else:
         res.warn("properties-files-identical", table.name, f"only {'hats.properties' if a.exists() else 'properties'} present")
     return _props(table)
@@ -239,9 +282,15 @@ def check_table(table: Path, kind: str, collection: Path, res: Results, metadata
     missing = [k for k in req if not props.get(k)]
     res.check(not missing, "required-properties", table.name, f"type {ttype}: all present", f"type {ttype}: missing {missing}")
 
-    for key, vocab in (("obs_regime", OBS_REGIMES), ("hats_frame", HATS_FRAMES)):
-        if props.get(key):
-            res.check(props[key] in vocab, f"vocabulary:{key}", table.name, props[key], f"{props[key]!r} not in {sorted(vocab)}")
+    if props.get("obs_regime"):   # a space-separated list is allowed ("Infrared Optical"); every word must be known
+        words = props["obs_regime"].split()
+        unknown = [w for w in words if w not in OBS_REGIMES]
+        res.check(not unknown, "vocabulary:obs_regime", table.name,
+                  props["obs_regime"] if len(words) == 1 else f"multiple regimes: {' '.join(words)}",
+                  f"{props['obs_regime']!r}: {unknown} not in {sorted(OBS_REGIMES)}")
+    if props.get("hats_frame"):
+        res.check(props["hats_frame"] in HATS_FRAMES, "vocabulary:hats_frame", table.name, props["hats_frame"],
+                  f"{props['hats_frame']!r} not in {sorted(HATS_FRAMES)}")
     if props.get("hats_status"):
         words = props["hats_status"].split()
         ok = all(any(w in group for w in words) for group in HATS_STATUS_WORDS) and all(any(w in g for g in HATS_STATUS_WORDS) for w in words)
@@ -279,12 +328,13 @@ def check_table(table: Path, kind: str, collection: Path, res: Results, metadata
             res.check(same, "thumbnail-schema", table.name, f"{pq.read_metadata(thumb).num_rows} rows, schema matches",
                       "data_thumbnail.parquet schema differs from _common_metadata")
         else:
-            (res.fail if ttype == "object" else res.warn)("thumbnail-present", table.name,
-                                                           "data_thumbnail.parquet missing (RECOMMENDED for object catalogs)")
-        res.check((table / "per_partition_statistics.parquet").exists(), "per-partition-statistics", table.name, "present",
-                  "per_partition_statistics.parquet missing (RECOMMENDED)")
+            (res.trial_fail if ttype == "object" else res.warn)("thumbnail-present", table.name,
+                                                                 "data_thumbnail.parquet missing (RECOMMENDED for object catalogs)")
+        res.check_trial((table / "per_partition_statistics.parquet").exists(), "per-partition-statistics", table.name,
+                        "present", "per_partition_statistics.parquet missing (RECOMMENDED)")
         for order in (props.get("hats_skymap_alt_orders") or "").split():
-            res.check((table / f"skymap.{order}.fits").exists(), "skymap-alt-order", f"{table.name}/skymap.{order}.fits", "present", "missing")
+            res.check_trial((table / f"skymap.{order}.fits").exists(), "skymap-alt-order",
+                            f"{table.name}/skymap.{order}.fits", "present", "missing")
     if kind in ("margin", "index"):
         url = props.get("hats_primary_table_url", "")
         if url.startswith("/"):
@@ -317,10 +367,30 @@ def check_voparquet(tables: list[Path], res: Results) -> None:
                       f"present in {sum(has)}/{len(has)} partitions (must be all or none)")
 
 
-def check_collection(collection: Path, res: Results) -> tuple[Path, list[Path], list[Path]]:
+def collection_properties(collection: Path) -> dict:
+    cp = collection / "collection.properties"
+    return read_properties(cp) if cp.exists() else {}
+
+
+def primary_table(collection: Path, cfg) -> Path:
+    """The main catalog: collection.properties' hats_primary_table_url (relative to the collection, or absolute);
+    [names].catalog only when collection.properties is absent or names no table. A trial build is written as
+    trial_<collection>/trial_<catalog>, so the configured name alone does not find it."""
+    url = collection_properties(collection).get("hats_primary_table_url", "").strip()
+    if url:
+        return Path(url) if url.startswith("/") else collection / url
+    return collection / cfg["names"]["catalog"]
+
+
+def _expected_margins(cfg) -> int:
+    m = cfg["margins"]
+    return (1 if float(m.get("default_arcsec") or 0) > 0 else 0) + len(m.get("extra_arcsec") or [])
+
+
+def check_collection(collection: Path, cfg, res: Results) -> tuple[Path, list[Path], list[Path]]:
     cp = collection / "collection.properties"
     res.check(cp.exists(), "required-file", "collection.properties", "present", "missing")
-    props = read_properties(cp) if cp.exists() else {}
+    props = collection_properties(collection)
     for key in ("obs_collection", "hats_primary_table_url"):
         res.check(bool(props.get(key)), "required-properties", f"collection:{key}", props.get(key, ""), "missing")
     margins = (props.get("all_margins") or "").split()
@@ -328,13 +398,332 @@ def check_collection(collection: Path, res: Results) -> tuple[Path, list[Path], 
     if margins:
         res.check(not default_margin or default_margin in margins, "default-margin-listed", default_margin or "(none)",
                   "in all_margins", f"default_margin {default_margin!r} not in all_margins {margins}")
+        res.check(bool(default_margin), "default-margin-declared", collection.name, f"default_margin={default_margin}",
+                  f"all_margins lists {len(margins)} margin(s) but no default_margin: lsdb never loads a margin")
+    else:
+        res.ok("default-margin-declared", collection.name, "no all_margins (nothing to declare)")
     tokens = (props.get("all_indexes") or "").split()   # "column dir column dir ..." pairs
     indexes = tokens[1::2] if len(tokens) % 2 == 0 else tokens
-    main = collection / props.get("hats_primary_table_url", "")
+    want_margins, want_indexes = _expected_margins(cfg), len(cfg["index"].get("columns") or [])
+    res.check_trial(len(margins) >= want_margins, "margins-present", collection.name,
+                    f"{len(margins)} margin(s) listed, {want_margins} configured",
+                    f"{len(margins)} margin(s) listed in all_margins, {want_margins} configured in [margins]")
+    res.check_trial(len(indexes) >= want_indexes, "indexes-present", collection.name,
+                    f"{len(indexes)} index table(s) listed, {want_indexes} configured",
+                    f"{len(indexes)} index table(s) listed in all_indexes, {want_indexes} configured in [index].columns")
+    main = primary_table(collection, cfg)
     res.check(main.is_dir(), "primary-table", main.name, "directory present", f"{main} missing")
     margin_paths = [collection / m for m in margins]
     index_paths = [collection / i for i in indexes]
     return main, margin_paths, index_paths
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# b2. Defects found on served catalogs (data.lsdb.io audit 2026-10-23): schema, margins, point map, sampled values
+# ----------------------------------------------------------------------------------------------------------------
+def _one_line(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}".strip().splitlines()
+    return text[0][:300] if text else type(exc).__name__
+
+
+def guarded(res: Results, test: str, target: str, fn, *args, **kwargs):
+    """Run one check; an exception becomes a WARN "check skipped: <reason>" instead of ending the run."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        res.warn(test, target, f"check skipped: {_one_line(exc)}")
+        return None
+
+
+def _stray(names) -> list[str]:
+    return [n for n in names if n in STRAY_COLUMNS or n.startswith("__index_level")]
+
+
+def _leaf_file(partition: Path) -> Path:
+    """A partition is a file or a directory of files; its first file stands for the schema."""
+    return partition if partition.is_file() else sorted(partition.rglob("*.parquet"))[0]
+
+
+def _size(partition: Path) -> int:
+    return partition.stat().st_size if partition.is_file() else sum(f.stat().st_size for f in partition.rglob("*.parquet"))
+
+
+def _read(partition: Path, columns=None) -> pa.Table:
+    # partitioning=None: no hive discovery, so files carrying Norder/Dir/Npix columns read cleanly
+    return pq.read_table(partition, columns=columns, partitioning=None)
+
+
+def _table_schema(table: Path) -> pa.Schema:
+    cm = table / "dataset" / "_common_metadata"
+    if cm.exists():
+        return pq.read_schema(cm)
+    return pq.read_schema(_leaf_file(data_files(table)[0]))
+
+
+def _pixels(table: Path) -> set[tuple[int, int]]:
+    pi = table / "partition_info.csv"
+    if pi.exists():
+        import pandas as pd
+        df = pd.read_csv(pi)
+        return set(zip(df["Norder"].astype(int), df["Npix"].astype(int)))
+    pat = re.compile(r"Norder=(\d+)/Dir=\d+/Npix=(\d+)")
+    return {(int(m.group(1)), int(m.group(2))) for f in data_files(table) if (m := pat.search(f.as_posix()))}
+
+
+def sample_partitions(table: Path, n: int = 3) -> list[Path]:
+    """Up to n partitions: the first, the median-size one and the last (path order)."""
+    files = data_files(table)
+    if len(files) <= n:
+        return files
+    by_size = sorted(files, key=_size)
+    picks = [files[0], by_size[len(by_size) // 2], files[-1]]
+    return list(dict.fromkeys(picks))
+
+
+def check_stray_columns(tables: list[Path], sample: list[Path], res: Results) -> None:
+    for table in tables:
+        sources = {"_common_metadata": _table_schema(table).names}
+        if table == tables[0]:
+            sources.update({f.name: pq.read_schema(_leaf_file(f)).names for f in sample})
+        found = {src: _stray(names) for src, names in sources.items() if _stray(names)}
+        res.check(not found, "stray-columns", table.name,
+                  f"no Norder/Dir/Npix/_hipscat_index/__index_level_* columns in {len(sources)} schema(s)",
+                  "stray columns (pre-0.5 hipscat hive keys or pandas index; break hive-partitioned reads): "
+                  + "; ".join(f"{src}: {cols}" for src, cols in found.items()))
+
+
+def check_hive_read(table: Path, sample: list[Path], res: Results) -> None:
+    """pq.read_table(file) with default arguments, and the same file read as a member of the hive-partitioned
+    dataset (as a reader of the dataset directory sees it): a Norder/Dir/Npix column in the file clashes with the
+    hive key ("Field Norder has incompatible types")."""
+    import pyarrow.dataset as ds
+
+    f = _leaf_file(sample[0])
+    first = pq.read_schema(f).names[0]
+    errors = []
+    try:
+        pq.read_table(f, columns=[first])
+    except Exception as exc:
+        errors.append(f"pq.read_table: {_one_line(exc)}")
+    try:
+        ds.dataset([str(f)], format="parquet", partitioning="hive",
+                   partition_base_dir=str(table / "dataset")).to_table(columns=[first])
+    except Exception as exc:
+        errors.append(f"hive dataset: {_one_line(exc)}")
+    res.check(not errors, "hive-read", f"{table.name}/{f.name}",
+              "reads with default arguments and as a hive-partitioned dataset member", "; ".join(errors))
+
+
+def check_pandas_index(table: Path, sample: list[Path], res: Results) -> None:
+    sources = {"_common_metadata": _table_schema(table)}
+    sources.update({f.name: pq.read_schema(_leaf_file(f)) for f in sample})
+    found = {}
+    for src, schema in sources.items():
+        raw = (schema.metadata or {}).get(b"pandas")
+        if raw:
+            cols = [c for c in json.loads(raw).get("index_columns", []) if isinstance(c, str)]
+            if cols:
+                found[src] = cols
+    res.check_warn(not found, "pandas-index-metadata", table.name,
+                   f"no non-range pandas index declared in {len(sources)} schema(s)",
+                   "pandas metadata declares index column(s) (to_pandas sets them as the index): "
+                   + "; ".join(f"{src}: {cols}" for src, cols in found.items()))
+
+
+def check_coordinate_dtype(table: Path, props: dict, res: Results) -> None:
+    schema = _table_schema(table)
+    for key in ("hats_col_ra", "hats_col_dec"):
+        col = props.get(key, "")
+        if not col or col not in schema.names:
+            res.fail("coordinate-dtype", f"{table.name}:{key}", f"{key}={col!r} not in the schema")
+            continue
+        t = schema.field(col).type
+        if pa.types.is_float64(t):
+            res.ok("coordinate-dtype", f"{table.name}:{col}", "double")
+        elif pa.types.is_floating(t):
+            top = 360 if key == "hats_col_ra" else 90
+            step = float(np.spacing(np.array(top, dtype=t.to_pandas_dtype()))) * 3600
+            res.fail("coordinate-dtype", f"{table.name}:{col}",
+                     f"{t.bit_width}-bit float: value spacing {step:.3f} arcsec at {top} deg; sub-arcsecond precision lost (need double)")
+        else:
+            res.warn("coordinate-dtype", f"{table.name}:{col}", f"type {t}, expected double")
+
+
+def check_margin_schema(main: Path, margin: Path, res: Results) -> None:
+    cat, mar = _table_schema(main), _table_schema(margin)
+    cn = cat.names
+    mn = [n for n in mar.names if n not in MARGIN_PIXEL_COLUMNS]
+    only_cat = [n for n in cn if n not in set(mn)]
+    only_mar = [n for n in mn if n not in set(cn)]
+    if only_cat or only_mar:
+        res.fail("margin-schema-matches", margin.name,
+                 f"column names differ: {len(only_cat)} only in catalog {only_cat[:5]}, "
+                 f"{len(only_mar)} only in margin {only_mar[:5]}")
+        return
+    types = [f"{n}: {cat.field(n).type} vs {mar.field(n).type}" for n in cn if cat.field(n).type != mar.field(n).type]
+    if types:
+        res.warn("margin-schema-matches", margin.name, f"{len(types)} column(s) differ in type (catalog vs margin): {types[:5]}")
+    elif cn != mn:
+        res.warn("margin-schema-matches", margin.name, f"same {len(cn)} names and types, different order")
+    else:
+        res.ok("margin-schema-matches", margin.name, f"{len(cn)} columns, names and types equal the catalog's")
+
+
+def check_margin_pixels(main: Path, margin: Path, res: Results) -> None:
+    cpix, mpix = _pixels(main), _pixels(margin)
+    extra = sorted(mpix - cpix)
+    res.check_warn(not extra, "margin-pixels-subset", margin.name,
+                   f"all {len(mpix):,} margin pixels are catalog pixels ({len(cpix):,})",
+                   f"{len(extra):,} of {len(mpix):,} margin pixels not among the catalog's {len(cpix):,} "
+                   f"(margin rows for empty catalog pixels; harmless) e.g. {extra[:3]}")
+
+
+def check_point_map(table: Path, props: dict, res: Results) -> None:
+    """open_catalog builds the MOC from point_map.fits on every open (order 10 = 100 MB, order 12 ~95 s); skymap.fits is
+    not read on open, so its order is recorded only. Both maps must sum to hats_nrows."""
+    from hats.io.file_io import read_fits_image
+
+    names = [n for n in ("point_map.fits", "skymap.fits") if (table / n).exists()]
+    if not names:
+        res.warn("point-map-order", table.name, "neither point_map.fits nor skymap.fits present")
+        return
+    nrows = int(props.get("hats_nrows") or -1)
+    for name in names:
+        target = f"{table.name}/{name}"
+        img = read_fits_image(table / name)
+        order = int(round(np.log(len(img) / 12) / np.log(4)))
+        mb = (table / name).stat().st_size / 1e6
+        if name == "point_map.fits":
+            res.check_warn(order <= 8, "point-map-order", target, f"order {order} ({len(img):,} cells, {mb:.1f} MB file)",
+                           f"order {order} ({len(img):,} cells, {mb:.1f} MB file): open_catalog expands it and rebuilds "
+                           "the MOC on every open; order <= 8 recommended")
+        else:
+            res.ok("point-map-order", target, f"order {order} ({len(img):,} cells, {mb:.1f} MB file; not read by open_catalog)")
+        total = int(img.sum())
+        res.check(total == nrows, "point-map-sum", target, f"sum {total:,} = hats_nrows",
+                  f"sum {total:,} != hats_nrows {nrows:,} (diff {total - nrows:+,})")
+
+
+def _id_columns(props: dict, cfg) -> list[str]:
+    ids = (props.get("hats_cols_survey_id") or "").split()
+    if not ids:
+        ids = cfg["columns"].get("id") or []
+        ids = [ids] if isinstance(ids, str) else list(ids)
+    return [i for i in ids if i]
+
+
+def check_sampled_values(table: Path, props: dict, cfg, sample: list[Path], res: Results) -> None:
+    """Duplicate ids, sort order and coordinates on the sampled partitions, reading only the needed columns."""
+    target = f"{table.name} ({len(sample)} sampled)"
+    schema = _table_schema(table)
+    ra, dec = props.get("hats_col_ra", ""), props.get("hats_col_dec", "")
+    hpx = props.get("hats_col_healpix") or "_healpix_29"
+    hpx = hpx if hpx in schema.names else None
+    ids = _id_columns(props, cfg)
+    missing_ids = [i for i in ids if i not in schema.names]
+    columns = list(dict.fromkeys([c for c in (ra, dec, hpx, *ids) if c and c in schema.names]))
+    parts = {f: _read(f, columns) for f in sample}
+
+    def duplicates():
+        if not ids or missing_ids:
+            res.warn("sampled-duplicate-ids", target, f"no id column to test (ids {ids}, missing {missing_ids})")
+            return
+        t = pa.concat_tables([p.select(ids) for p in parts.values()])
+        unique = t.group_by(ids).aggregate([]).num_rows
+        dup = t.num_rows - unique
+        share = dup / t.num_rows if t.num_rows else 0.0
+        msg = f"{dup:,} duplicate {'+'.join(ids)} rows of {t.num_rows:,} sampled ({share:.3%})"
+        if dup == 0:
+            res.ok("sampled-duplicate-ids", target, msg)
+        elif _table_type(props) == "object" and share > 0.001:
+            res.fail("sampled-duplicate-ids", target, msg + "; object catalog, limit 0.1%")
+        else:
+            res.warn("sampled-duplicate-ids", target, msg + (" (source table: repeats may be legitimate)"
+                                                             if _table_type(props) != "object" else ""))
+
+    def sorted_check():
+        if not hpx:
+            res.warn("sampled-sorted", target, "no spatial index column")
+            return
+        bad = []
+        for f, t in parts.items():
+            h = t[hpx].to_numpy()
+            descents = int(np.count_nonzero(h[1:] < h[:-1]))
+            if descents:
+                bad.append(f"{f.name}: {descents:,} descents")
+        res.check_warn(not bad, "sampled-sorted", target, f"{hpx} non-decreasing in every sampled partition",
+                       f"{hpx} not sorted within {len(bad)} partition(s): {bad}")
+
+    def coordinates():
+        from hats.pixel_math.spatial_index import compute_spatial_index
+
+        if not (ra in schema.names and dec in schema.names):
+            res.fail("sampled-coordinates", target, f"hats_col_ra/dec {ra!r}/{dec!r} not in the schema")
+            return
+        r = np.concatenate([t[ra].to_numpy(zero_copy_only=False).astype(np.float64) for t in parts.values()])
+        d = np.concatenate([t[dec].to_numpy(zero_copy_only=False).astype(np.float64) for t in parts.values()])
+        finite = np.isfinite(r) & np.isfinite(d)
+        out = finite & ((r < 0) | (r >= 360) | (d < -90) | (d > 90))
+        good = finite & ~out
+        n_nonfinite, n_out = int((~finite).sum()), int(out.sum())
+        msg = f"{len(r):,} rows: {n_nonfinite:,} non-finite, {n_out:,} out of range"
+        mismatch_share = 0.0
+        if hpx:
+            stored = np.concatenate([t[hpx].to_numpy(zero_copy_only=False) for t in parts.values()]).astype(np.int64)
+            recomputed = np.asarray(compute_spatial_index(r[good], d[good]), dtype=np.int64)
+            mismatch = int(np.count_nonzero(recomputed != stored[good]))
+            mismatch_share = mismatch / max(int(good.sum()), 1)
+            msg += f", {hpx} recomputed differs for {mismatch:,} ({mismatch_share:.4%}; limit 0.01%)"
+        else:
+            msg += ", no spatial index column to recompute"
+        res.check(n_nonfinite == 0 and n_out == 0 and mismatch_share <= 1e-4, "sampled-coordinates", target, msg, msg)
+
+    guarded(res, "sampled-duplicate-ids", target, duplicates)
+    guarded(res, "sampled-sorted", target, sorted_check)
+    guarded(res, "sampled-coordinates", target, coordinates)
+
+
+def check_all_null(table: Path, sample: list[Path], res: Results) -> None:
+    """Columns null in every row of every sampled partition (one full partition in memory at a time)."""
+    nulls: dict[str, int] = {}
+    types: dict[str, pa.DataType] = {}
+    rows = 0
+    for f in sample:
+        t = _read(f)
+        rows += t.num_rows
+        for name in t.column_names:
+            nulls[name] = nulls.get(name, 0) + t[name].null_count
+            types[name] = t.schema.field(name).type
+        del t
+    names = [n + ("[null type]" if pa.types.is_null(types[n]) else "") for n, c in nulls.items() if rows and c == rows]
+    target = f"{table.name} ({len(sample)} sampled)"
+    res.check_warn(not names, "sampled-all-null-columns", target,
+                   f"no column entirely null in {rows:,} sampled rows ({len(nulls)} columns)",
+                   f"{len(names)} of {len(nulls)} columns null in all {rows:,} sampled rows: {names[:15]}"
+                   + (f" (+{len(names) - 15} more)" if len(names) > 15 else ""))
+
+
+def check_served_defects(main: Path, margins: list[Path], props: dict, cfg, res: Results) -> None:
+    """Checks for the defects found on served catalogs; each one is skipped with a WARN if it cannot run."""
+    sample = guarded(res, "sample-partitions", main.name, sample_partitions, main)
+    if sample:
+        res.ok("sample-partitions", main.name, "; ".join(f"{f.parent.parent.name}/{f.parent.name}/{f.name} "
+                                                       f"{_size(f) / 1e6:.1f} MB" for f in sample))
+    elif sample is not None:
+        res.warn("sample-partitions", main.name, "no data partitions found")
+    sample = sample or []
+    guarded(res, "stray-columns", main.name, check_stray_columns, [main, *margins], sample, res)
+    if sample:
+        guarded(res, "hive-read", main.name, check_hive_read, main, sample, res)
+    guarded(res, "pandas-index-metadata", main.name, check_pandas_index, main, sample, res)
+    guarded(res, "coordinate-dtype", main.name, check_coordinate_dtype, main, props, res)
+    for m in margins:
+        guarded(res, "margin-schema-matches", m.name, check_margin_schema, main, m, res)
+        guarded(res, "margin-pixels-subset", m.name, check_margin_pixels, main, m, res)
+    guarded(res, "point-map-order", main.name, check_point_map, main, props, res)
+    if sample:
+        guarded(res, "sampled-values", main.name, check_sampled_values, main, props, cfg, sample, res)
+        guarded(res, "sampled-all-null-columns", main.name, check_all_null, main, sample, res)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -347,6 +736,7 @@ def sweep(files: list[Path], label: str, want: dict, res: Results, codec_only: b
     want_enc = want.get("column_encoding") or {}
     dict_override = set(want["use_dictionary"]) if isinstance(want.get("use_dictionary"), list) else set()
     bad_codec, bad_index, bad_enc, encodings, created_by, row_groups = [], [], [], set(), set(), []
+    offset_only = 0
     for f in files:
         md = pq.read_metadata(f)
         created_by.add(md.created_by)
@@ -358,12 +748,13 @@ def sweep(files: list[Path], label: str, want: dict, res: Results, codec_only: b
                 if cc.compression.upper() != want_codec:
                     bad_codec.append(f"{f.name}:{cc.path_in_schema}={cc.compression}")
                 if not codec_only:
-                    # pyarrow writes no column index for chunks whose statistics carry no min/max (e.g. all-NaN
-                    # floats in a tiny partition); the offset index is always written with write_page_index.
-                    st = cc.statistics
-                    needs_column = bool(st is not None and st.has_min_max)
-                    if want_index and (not cc.has_offset_index or (needs_column and not cc.has_column_index)):
+                    # pyarrow omits the column index when page statistics cannot be formed (pages full of NaN,
+                    # e.g. nested float leaves); the offset index is always written with write_page_index, so
+                    # only a missing offset index fails
+                    if want_index and not cc.has_offset_index:
                         bad_index.append(f"{f.name}:{cc.path_in_schema}")
+                    elif want_index and not cc.has_column_index:
+                        offset_only += 1
                     if not want_index and (cc.has_offset_index or cc.has_column_index):
                         bad_index.append(f"{f.name}:{cc.path_in_schema}")
                     # hats defaults: BYTE_STREAM_SPLIT on float leaves, DELTA_BINARY_PACKED on _healpix_29; margin and
@@ -385,8 +776,11 @@ def sweep(files: list[Path], label: str, want: dict, res: Results, codec_only: b
               f"{len(bad_codec)} column chunks not {want_codec}: {bad_codec[:5]}")
     if not codec_only:
         res.check(not bad_index, f"encoding-page-index:{label}", f"{len(files)} files",
-                  "offset+column index " + ("present" if want_index else "absent") + " everywhere",
-                  f"{len(bad_index)} column chunks without the expected page index: {bad_index[:5]}")
+                  ("offset+column index present everywhere" if not offset_only else
+                   f"offset index present everywhere; {offset_only} chunks with offset index only (NaN pages)")
+                  if want_index else "offset+column index absent everywhere",
+                  (f"{len(bad_index)} column chunks without an offset index: {bad_index[:5]}" if want_index else
+                   f"{len(bad_index)} column chunks with a page index although write_page_index is off: {bad_index[:5]}"))
         res.check(not bad_enc, f"encoding-columns:{label}", f"{len(files)} files",
                   "float leaves BYTE_STREAM_SPLIT, _healpix_29 DELTA_BINARY_PACKED (hats >= 0.11.1 defaults + [writer])",
                   f"{len(bad_enc)} column chunks with another encoding (written by hats < 0.11.1 or without the hats "
@@ -447,6 +841,9 @@ def main(argv=None) -> int:
                          "a re-check of a hosted copy should pass its own file so the build's results are kept")
     ap.add_argument("--spot-check", action="store_true", help="re-encode one row group at the configured level and compare sizes")
     ap.add_argument("--no-pypi", action="store_true", help="skip the newer-release lookup")
+    ap.add_argument("--trial", action="store_true",
+                    help="trial build (import_collection.py --trial-file): thumbnail, per-partition statistics, "
+                         "alternate skymaps and margin/index presence become WARN; data checks keep full strength")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config)
@@ -462,10 +859,10 @@ def main(argv=None) -> int:
     out = Path(a.results_file).resolve() if a.results_file else work_dir / "verify_results.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     verifier_csv = out.with_name(f"{out.stem}_hats_import.csv") if a.results_file else work_dir / "hats_import_verifier_results.csv"
-    res = Results()
+    res = Results(trial=a.trial)
     runlog(cfg, "start", "verify-structure", f"collection {collection.name}")
 
-    main_catalog = collection / cfg["names"]["catalog"]
+    main_catalog = primary_table(collection, cfg)
     if (main_catalog / "dataset" / "_metadata").exists():
         print(f"== a. hats-import verification pipeline on {collection}")
         try:
@@ -481,7 +878,7 @@ def main(argv=None) -> int:
         footer_verification(main_catalog, truth_rows, res)
 
     print("== b. HATS-note compliance")
-    main, margins, indexes = check_collection(collection, res)
+    main, margins, indexes = check_collection(collection, cfg, res)
     no_metadata = not cfg["writer"].get("create_metadata", True)
     main_props = check_table(main, "catalog", collection, res, metadata_optional=no_metadata)
     for m in margins:
@@ -490,6 +887,7 @@ def main(argv=None) -> int:
         check_table(i, "index", collection, res, metadata_optional=no_metadata)
     check_voparquet([main, *margins], res)
     check_builder_versions(main_props.get("hats_builder", ""), versions.get("hats", ""), main.name, res)
+    check_served_defects(main, margins, main_props, cfg, res)
 
     print("== c. Parquet encoding sweep")
     main_files = data_files(main)

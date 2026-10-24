@@ -13,6 +13,9 @@ route = "hats-import"               # (interview) "hats-import" | "small" | "rei
                                     # the source's properties are kept unless restated in [properties])
 reimport_from = ""                  # route "reimport": existing HATS catalog or collection root whose partition files are the input
 reimport_of = ""                    # (interview, informational) path or URL of the HATS version being replaced; compare_versions.py --old takes it
+expect_differences = false          # (interview) true when this version FIXES reimport_of (wrong values, columns or types): compare_versions
+expect_removed_rows = false         # (interview) true when this version REMOVES rows of reimport_of on purpose (duplicate rows, rows without coordinates): compare_versions reports ids only in the old copy as expected (exit 4)
+                                    # then reports those differences as expected (exit 4) and fails only on different rows or ids
 
 [source]
 urls = []                           # files to download into raw_dir (https only)
@@ -63,7 +66,8 @@ nested_time_series = false          # (interview, informational) true = one row 
 [names]                             # (interview) see reference/properties.md "naming"
 collection = "mysurvey_dr1"         # collection directory; obs_collection of the collection
 catalog = "mysurvey_dr1"            # main catalog directory; obs_collection of the catalog
-public_name = "mysurvey_dr1"        # URL path on the web host: <HATS_PUBLISH_WEB_URL>/<public_name>
+public_name = "mysurvey_dr1"        # URL path on the web host: <HATS_PUBLISH_WEB_URL>/<public_name>; may be nested in a group directory
+                                    # ("<group>/<catalog>"); the data copy stays at <survey>/<collection>, only the web link is nested
 
 [partitioning]                      # (interview) see reference/import.md "partitioning"
 target_file_mb = [200, 800]         # the sizing rule in MB (10^6 bytes); estimate_threshold.py derives pixel_threshold from it
@@ -115,10 +119,18 @@ extra = {}                          # any other key -> value
 
 [writer]                            # overrides of the hats Parquet defaults (hats >= 0.11.1), which are the team standard:
                                     # ZSTD 15, page index, statistics, BYTE_STREAM_SPLIT floats, DELTA_BINARY_PACKED _healpix_29,
-                                    # dictionary on the rest. Leave the overrides unset for a standard run.
+                                    # dictionary on the rest, 100 000-row row groups. After the trial (phase 4) run
+                                    # choose_encoding.py --write: it measures dictionary vs BYTE_STREAM_SPLIT per float leaf on a
+                                    # partition and sets use_dictionary and row_group_size below (BSS inflates low-cardinality
+                                    # floats 2-6x, typical of archive CSVs); leave compression and column_encoding unset.
 # compression = "zstd"
 # compression_level = 15
-# use_dictionary = ["COL"]          # only these columns get a dictionary (an empty list is ignored, not "none")
+# use_dictionary = ["COL"]          # only these leaves get a dictionary (an empty list is ignored, not "none"): every non-float
+                                    # leaf plus the floats where dictionary is smaller; the floats not listed get BYTE_STREAM_SPLIT;
+                                    # Parquet leaf paths ("A.list.element", "lc.flux.list.element"); _healpix_29 is never listed
+# row_group_size = 100000           # rows per row group: 100000 when BYTE_STREAM_SPLIT dominates, 250000 when dictionary-encoded
+                                    # leaves hold most bytes (each row group repeats its dictionaries); when set it replaces
+                                    # [partitioning].row_groups for the catalog partitions ({ strategy = "num_rows", value = N })
 # column_encoding = { COL = "PLAIN" }  # per-leaf encoding overrides, Parquet path ("A.list.element")
 create_metadata = true              # dataset/_metadata (all row-group footers in one file); false when it would pass Parquet's 4 GiB footer limit (~10^5 row groups x a few hundred columns)
 

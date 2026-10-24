@@ -10,7 +10,7 @@ verification) and the public import recipes under `catalogs/public/`.
 
 | Table | Route | Why |
 |---|---|---|
-| under about 1 M rows and 1 GB in memory | `import_small.py` (`lsdb.from_dataframe`) | documented limit of the in-memory loader (https://docs.lsdb.io/en/stable/tutorials/import_catalogs.html); one margin at most, no index tables, `num_rows` row groups only |
+| under about 1 M rows and 1 GB in memory | `import_small.py` (`lsdb.from_dataframe`) | documented limit of the in-memory loader (https://docs.lsdb.io/en/stable/tutorials/import_catalogs.html); one margin at most, no index tables; row groups as on the hats-import route |
 | | | note: with lsdb 0.11 the write step is slow for wide tables (minutes per 100 k rows at 300 columns, see pitfalls); hats-import is faster beyond a few tens of thousands of rows × hundreds of columns |
 | anything larger, or many files | `import_collection.py` (hats-import) | parallel, resumable, produces margins and index tables in one collection |
 
@@ -41,6 +41,13 @@ Rules of thumb from the hats-import docs:
 - `use_schema_file` keeps column order and types stable across input files with uneven schemas
   (`notebooks/unequal_schema`); `[reader].conform_schema` does the same inside the skill's reader chain for any
   input format (missing columns become null, extra columns are an error) and the verification loader applies it too.
+- CSV missing values: by default only an empty field and the float NaN spellings (`nan`, `NaN`, `NAN`, `-nan`,
+  `-NaN`) are missing; `NA`, `N/A`, `NULL` and `None` are kept as text. Set `keep_default_na`, `na_values` or
+  `na_filter` in `[reader].csv_kwargs` to change this. The verification loader applies the same rule.
+- CSV names: `[reader].column_names` and the `type_map` keys must be strings. With `[reader].schema_file`, the
+  schema must hold exactly the reader's columns after `[columns].drop` and `rename`; the import stops otherwise,
+  because the reduce step writes a schema column the reader does not produce as all-null and drops a reader column
+  the schema lacks.
 
 ## Tables without coordinates
 
@@ -62,13 +69,15 @@ reader: it turns the quoted booleans of the flag arrays (`"False"`) into `True`.
 - Keep data files between about 200 and 800 MB and never more than a couple of GB
   (`notebooks/estimate_pixel_threshold`). `estimate_threshold.py` samples the input, writes it with the run's
   writer settings and converts the target size into `pixel_threshold` (rows per partition);
-  `byte_pixel_threshold` partitions by bytes instead.
+  `byte_pixel_threshold` partitions by bytes instead. Its `_metadata` size prediction counts row groups with
+  `[writer].row_group_size` when set, else `[partitioning].row_groups`.
 - `highest_order` caps the splitting; if the densest region cannot get under the threshold the Binning stage
   raises and the order must be increased. `lowest_order` and `constant_order` serve sparse catalogs that will be
   joined to dense ones (`catalogs/arguments.html`, "sparse datasets").
 - Row groups: `subtile_order_delta = 1` gives up to four groups per file split by sub-pixel (the Rubin pipeline's
   setting, https://github.com/lincc-frameworks/rubin-dash `src/rubin_dash/config.py`); `num_rows` groups together with
-  `sort = "<id>"` make lookups by id cheaper.
+  `sort = "<id>"` make lookups by id cheaper. `[writer].row_group_size` (set by `choose_encoding.py`), when set,
+  replaces this setting; see "Writer settings".
 - `skymap_alt_orders = [2, 4, 6]` writes down-sampled skymaps used by the site and by quick plots.
 - Expect about 2.4× more partitions than total rows / threshold: adaptive binning leaves partitions between a quarter
   of the threshold and the threshold. `dataset/_metadata` holds one footer entry per row group of every file and
@@ -126,17 +135,42 @@ BYTE_STREAM_SPLIT on every float leaf, DELTA_BINARY_PACKED on `_healpix_29` and 
 dictionary on the other columns, 128 KiB data pages, 100 000-row row groups. The skill's own writers (thumbnail,
 statistics, sample files, materialised inputs) call the same function, so every file of a run has the same encoding.
 `[writer]` holds only departures from these defaults (`compression`, `compression_level`, `use_dictionary`,
-`column_encoding`) and is empty for a standard run. The compression level is not stored in Parquet metadata, which is
+`column_encoding`) plus `row_group_size`; `choose_encoding.py` sets `use_dictionary` and `row_group_size` after the
+trial. The compression level is not stored in Parquet metadata, which is
 why it is recorded in the README and the run log.
 
 The float encoding matters more than the compression level. hats 0.11.0 and older wrote floats with pyarrow's default
 dictionary encoding. Measured on a Legacy Surveys DR11 partition (94 k rows, 233 columns, mostly float): dictionary
 and ZSTD 15 gave 155 MB; BYTE_STREAM_SPLIT and ZSTD 15 gave 111 MB, 29 % smaller. Changing the ZSTD level from 15 to
 3 or 19 changed either result by less than 4 %. The whole DR11 catalog would be about 3 TiB smaller. The encoding sweep
-fails files whose float columns are not BYTE_STREAM_SPLIT.
+fails float columns that are not BYTE_STREAM_SPLIT unless `[writer].use_dictionary` lists them.
 
 Cost: on a 4-billion-row catalog ZSTD level 15 was about 96 % of the reducing stage; level 3 was 2.8× faster for
 0.7 % more bytes. The published level stays 15 unless the user decides otherwise; record the choice.
+
+Per-column float encoding. BYTE_STREAM_SPLIT wins when a float column's values are nearly all distinct (0.6–0.8× of
+dictionary) and loses 2–6× when they are few: values rounded by an archive's CSV export, flags and counts stored as
+floats, constants. The number of distinct values decides, not the file format. Measured on one partition of each
+served catalog, the hats default gave archive-CSV catalogs 1.3–2.5× their current size, while catalogs from binary
+FITS or Parquet shrank to 0.6–0.8×; the per-leaf best was never worse than the default and up to 2.4× better.
+`choose_encoding.py`, run after the trial, writes the partition as a `dict` and a `hats` variant, keeps per float leaf
+the smaller one, checks the round trip and records `encoding_choice.json`. With `--write` it sets
+`[writer].use_dictionary` to the non-float leaves plus the floats where dictionary is smaller; floats not listed get
+BYTE_STREAM_SPLIT, `_healpix_29` stays DELTA_BINARY_PACKED, and there is no key when the default is already best. The
+encoding sweep in `verify_structure.py` accepts listed floats as dictionary.
+`[writer].use_dictionary` decides only float leaves: the skill adds every non-float leaf of each table it writes
+itself, and `Norder`/`Dir`/`Npix` for hats-import index tables. A hand-written list that leaves out some other
+non-float leaf of a hats-import catalog partition still loses its dictionary there (pyarrow gives a dictionary only
+to listed leaves), so prefer the list `choose_encoding.py` writes (it names every non-float leaf).
+
+Row groups. Under BYTE_STREAM_SPLIT the row-group size hardly matters; under dictionary every row group repeats its
+dictionaries, and 100 000-row groups cost 5–15 % against one group per file. `choose_encoding.py` sets
+`[writer].row_group_size` to 100 000 when BYTE_STREAM_SPLIT leaves hold most of the bytes and 250 000 when dictionary
+leaves do. hats-import and lsdb's `write_catalog` drop `row_group_size` from the writer arguments, so the templates
+pass row groups as `row_group_kwargs` on every route (hats-import, the small route and `attach_nested.py`):
+`[writer].row_group_size` when set (as `{"num_rows": N}`, replacing `[partitioning].row_groups`), else
+`[partitioning].row_groups` (so `subtile_order_delta` also works on the small route). `row_group_size` applies
+directly to margins, indexes and the skill's own files.
 
 ## Nested time-series products
 
@@ -153,11 +187,44 @@ and re-partitions it with hats-import at `[partitioning].pixel_threshold`, with 
 photometry: about 5.6 kB per source on disk), so `estimate_threshold.py` on the materialised files, not the row count
 of a flat catalog, sets the partition size.
 
-## Re-importing
+## Re-importing an existing HATS catalog
 
 `ImportArguments.reimport_from_hats(existing, output_dir, ...)` rebuilds a catalog from an existing HATS copy with
 new thresholds, sorting or row groups (`guide/reimporting.html`). Margins and index tables must be rebuilt
 afterwards. `reimport_from_hats` reuses the source's `_healpix_29`, so it takes no `sort_columns`,
-and it does not write `hats_col_healpix`, `hats_col_healpix_order` or `hats_cols_sort`; the skill's reimport route
-(`route = "reimport"`, `reimport_from`) leaves out sort columns and carries those properties over from the source. Write the new version to a new directory, verify it, repoint the hosted symlinks, and keep the old copy
-until the page and registry point to the new one.
+and it does not write `hats_col_healpix`, `hats_col_healpix_order` or `hats_cols_sort`.
+
+The skill's reimport route (`route = "reimport"`, `reimport_from`) does the same, and:
+
+- carries the source's properties over (`[properties]` overrides them), adds `hats_col_healpix=_healpix_29` and
+  `hats_col_healpix_order=29` when the source lacks them, and leaves out sort columns;
+- applies `[columns].drop`, and always removes the hipscat-era `Norder`/`Dir`/`Npix`; the `id`, `default`, `sort` and
+  `[index]` columns must survive the drop, and carried properties that name a removed column stop the run;
+  `rename` and `cast` are refused (rows keep the source's names and types; re-import from the raw files to change them);
+- writes `_healpix_29` as the first column;
+- rewrites the source `_common_metadata` to `<work_dir>/reimport_schema.parquet` when columns are removed, the order
+  changes or it carries pandas metadata, and passes that file as `use_schema_file` (a stale schema brings removed
+  columns back all-null);
+- has no default columns to carry when the source has none: set `[columns].default` (`reference/decisions.md`).
+
+Trial of a catalog you hold only remotely or in part. `--trial-file` needs one partition file and the source's
+metadata, not the whole catalog. Build a mini-source: a catalog directory with the source's `properties`,
+`hats.properties`, `partition_info.csv`, `dataset/_common_metadata`, `point_map.fits` or `skymap*.fits`, and one
+partition file at its original relative path (`dataset/Norder=N/Dir=D/Npix=P.parquet`). Point `[run].reimport_from`
+at it for the trial and at the real source for the full run.
+
+`compare_versions.py --new <trial collection> --old <source> --key <id> --trial`: the old side is bounded by the fine
+pixels (order max(old max order, 8), at most 12) that hold new rows, so a one-file trial reads only a few old
+partitions; `--trial` labels the run. Values are compared only for ids that are unique on both sides (duplicated ids
+are counted separately). With `[run].expect_differences = true` (`--expect-value-changes`) column, type and value
+differences are reported as expected (exit 4); different row sets or duplicate counts still exit 1. `--expect-removed-rows` (`[run].expect_removed_rows`) makes ids only in the old copy, and a lower duplicate count, expected differences (exit 4) for a re-import that removes rows on purpose; ids only in the new copy are always DIFFERENT.
+
+Pinning a batch of re-imports. `pin_templates.sh` copies the live skill directory when a run is pinned, at the run's
+start (`job.sbatch` pins when `templates.pinned/` does not exist yet). An edit of the skill made while a batch is
+starting reaches every run pinned after it. Pin every run of the batch once, before any of them starts, and do not
+edit the skill meanwhile; or run `pin_templates.sh` from a frozen copy of the templates directory (for `job.sbatch`,
+point `HATS_PUBLISH_TEMPLATES` at it).
+
+Write the new version to a new directory, verify it, compare it, refresh every copy (`reference/publishing.md`,
+"Fan-out after a re-import"), repoint the hosted symlinks, and keep the old copy until the page and registry point to
+the new one.

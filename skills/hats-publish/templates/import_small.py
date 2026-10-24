@@ -11,9 +11,10 @@ generation here is single-process. Index tables are not produced on this route (
 be run afterwards if one is needed).
 
 Differences from the hats-import route (lsdb 0.11 write_catalog):
-- [partitioning].row_groups: `num_rows` is applied (pyarrow row_group_size); `subtile_order_delta` is not available
-  here, so each file is written with pyarrow's default row groups (one group for partitions under ~1 M rows);
-  `single` is the same default.
+- Row groups: passed to write_catalog as row_group_kwargs (_common.row_group_kwargs), as on the hats-import route:
+  [writer].row_group_size when set (num_rows), else [partitioning].row_groups (`subtile_order_delta`, `num_rows`;
+  `single` = one row group per file, up to pyarrow's 1 Mi rows). lsdb 0.11 drops row_group_size from the writer
+  arguments, so row groups are set only through row_group_kwargs.
 - [writer].create_metadata is applied (create_parquet_metadata) to the catalog and its margin.
 - Only the default margin is built ([margins].default_arcsec; 0 = no margin); extra margins are not.
 - Fixed-size FITS array columns are written as Arrow fixed-size lists, as hats-import's FitsReader with
@@ -32,7 +33,7 @@ import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    check_versions, load_config, pin_cpus, properties_dict, runlog, validate_properties, writer_kwargs,
+    check_versions, load_config, pin_cpus, properties_dict, row_group_kwargs, runlog, validate_properties, writer_kwargs,
 )
 from catalog_source import load_source  # noqa: E402
 
@@ -154,13 +155,9 @@ def main(argv=None) -> int:
         raise SystemExit(f"{out} exists; pass --overwrite")
     runlog(cfg, "start", "import", "small route (lsdb.from_dataframe)", rows=len(df), partitions=len(pixels), orders=orders)
     t1 = time.time()
-    wk = writer_kwargs(cfg)
-    rg = p.get("row_groups") or {}
-    if rg.get("strategy") == "num_rows":
-        wk["row_group_size"] = int(rg.get("value", 200_000))
-    elif rg.get("strategy", "subtile_order_delta") == "subtile_order_delta":
-        print("note: [partitioning].row_groups subtile_order_delta is not available on the small route; "
-              "files get the hats default row groups (100 000 rows)")
+    wk = writer_kwargs(cfg, cat.hc_structure.schema)   # use_dictionary decides floats; non-float leaves keep a dictionary
+    rgk = row_group_kwargs(cfg)   # lsdb drops wk["row_group_size"]; row groups come only from row_group_kwargs
+    print(f"row groups: {rgk or 'one per file (up to 1 Mi rows)'}")
     cat.write_catalog(
         out, catalog_name=cfg["names"]["catalog"], as_collection=True, overwrite=a.overwrite,
         default_columns=cols.get("default") or None,
@@ -168,7 +165,7 @@ def main(argv=None) -> int:
         skymap_alt_orders=list(p.get("skymap_alt_orders") or []) or None,
         create_parquet_metadata=bool(cfg["writer"].get("create_metadata", True)),
         create_thumbnail=False, create_per_partition_statistics=True, create_summary=False,
-        write_table_kwargs=wk,
+        write_table_kwargs=wk, row_group_kwargs=rgk,
     )
     print(f"write_catalog (data, margin, metadata, per-partition statistics): {time.time() - t1:.0f}s")
     # extra margins on the small route: not produced (hats-import's margin pipeline can add them later)

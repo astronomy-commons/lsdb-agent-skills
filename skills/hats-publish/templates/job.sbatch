@@ -154,6 +154,8 @@ else
     echo "== compare with $old"
     CMP=(python "$T/compare_versions.py" --new "$collection" --old "$old" --key "$(cfg columns.id | tr -d "[]' ")"
          --sample-pixels "${HATS_PUBLISH_COMPARE_PIXELS:-40}" --max-rows "${HATS_PUBLISH_COMPARE_MAX_ROWS:-5000000}" --out compare_versions.csv)
+    [ "$(cfg run.expect_differences)" = "True" ] && CMP+=(--expect-value-changes)   # a re-import that fixes the old copy
+    [ "$(cfg run.expect_removed_rows)" = "True" ] && CMP+=(--expect-removed-rows)   # a re-import that removes rows on purpose
     if [ -n "${HATS_PUBLISH_LOCAL_CAPS:-}" ] && [ -n "${HATS_PUBLISH_MAX_MEM_GB:-}" ]; then
       "${CMP[@]}" > compare.log 2>&1 & cmppid=$!; echo $cmppid > compare.pid
       bash "$T/memwatch.sh" "$HATS_PUBLISH_MAX_MEM_GB" compare.pid > /dev/null 2>&1 &
@@ -162,8 +164,14 @@ else
       "${CMP[@]}" > compare.log 2>&1; cmp=$?
     fi
     echo "compare exit $cmp"
-    # 0 = identical, 3 = identical up to numeric narrowing (reported, not a failure), anything else = different or error
-    case $cmp in 0) ;; 3) echo "compare: identical up to type narrowing (see compare_versions.csv)" ;; *) failed+=("compare=$cmp") ;; esac
+    # 0 = identical, 3 = identical up to numeric narrowing, 4 = only the differences [run].expect_differences
+    # announces (same rows and ids); 3 and 4 are reported, not failures; anything else = different or error
+    case $cmp in
+      0) ;;
+      3) echo "compare: identical up to type narrowing (see compare_versions.csv)" ;;
+      4) echo "compare: expected differences only (review compare.log and compare_versions.csv: value changes, or rows removed on purpose)" ;;
+      *) failed+=("compare=$cmp") ;;
+    esac
   fi
 fi
 

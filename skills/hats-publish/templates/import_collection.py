@@ -5,6 +5,7 @@ entirely by catalog.toml.
 Usage:
     import_collection.py [--config catalog.toml] --dry-run           # print the resolved hats-import arguments
     import_collection.py [--config catalog.toml] --trial-file FILE   # import ONE input file into <build>/trial_<catalog>
+                                                                     # (no margins/indexes; [source].expected_files and expected_total_rows are not checked)
     import_collection.py [--config catalog.toml]                      # full import, resumable
     import_collection.py [--config catalog.toml] --client ADDRESS     # use an existing Dask scheduler
 
@@ -77,7 +78,9 @@ def file_reader(cfg, files=None, coordinate_filter=True, chunksize=None):
         kwargs.update(hdu=r.get("hdu", 1), flatten_tensors=bool(r.get("flatten_tensors", True)),
                       column_names=r.get("column_names") or None, skip_column_names=r.get("skip_column_names") or None)
     elif fmt in ("csv", "tsv", "indexed_csv"):
-        csv_kwargs = dict(r.get("csv_kwargs") or {})
+        from readers import check_csv_names, csv_na_defaults
+
+        csv_kwargs = csv_na_defaults(r.get("csv_kwargs") or {})   # empty field and NaN spellings only; "NA" is a value
         if fmt == "tsv":
             csv_kwargs.setdefault("sep", "\t"); fmt = "csv"
         data_files = list(files or [])
@@ -93,7 +96,18 @@ def file_reader(cfg, files=None, coordinate_filter=True, chunksize=None):
             header_types, ecsv_arrays = ecsv_pandas_types(data_files[0])
             type_map = header_types | {c: "str" for c in ecsv_arrays} | type_map
             csv_kwargs.setdefault("comment", "#")
-        kwargs.update(schema_file=work_path(cfg, r.get("schema_file")) or None, column_names=r.get("column_names") or None,
+        schema_file = work_path(cfg, r.get("schema_file")) or None
+        if schema_file:
+            import pyarrow.parquet as pq
+
+            schema_names = pq.read_schema(schema_file).names
+        else:
+            schema_names = None
+        problems = check_csv_names(r.get("column_names"), r.get("type_map"), schema_names,
+                                   drop=cfg["columns"].get("drop"), rename=cfg["columns"].get("rename"))
+        if problems:
+            raise SystemExit("[reader] CSV columns: " + "; ".join(problems))
+        kwargs.update(schema_file=schema_file, column_names=r.get("column_names") or None,
                       type_map=type_map or None, **csv_kwargs)
     elif fmt in ("parquet", "indexed_parquet"):
         # built directly: get_file_reader takes column_names as its own parameter and does not pass it on
@@ -178,17 +192,89 @@ def reimport_files(cat) -> list[str]:
     return sorted(str(p) for p in (cat.catalog_base_dir / DATASET_DIR).rglob(f"{PARTITION_ORDER}*/**/*{cat.catalog_info.npix_suffix}"))
 
 
+def reimport_columns(cfg, cat, source_schema) -> list[str] | None:
+    """The columns the reimport route reads and writes: the source schema without the hipscat-era partition columns
+    (Norder, Dir, Npix) and without [columns].drop, the spatial index (_healpix_29) first and the rest in source
+    order (the HATS note recommends the spatial index as the first column; lsdb-written sources have it elsewhere).
+    A dropped column that a configured or carried column list needs is an error."""
+    from hats.io.paths import HIVE_COLUMNS
+    from hats.pixel_math.spatial_index import SPATIAL_INDEX_COLUMN
+
+    c = cfg["columns"]
+    if c.get("rename") or c.get("cast"):
+        raise SystemExit("[columns].rename and [columns].cast are not applied on route \"reimport\" (rows are copied from the "
+                         "source Parquet files with their types): empty them, or re-import from the raw files")
+    drop = [str(d) for d in (c.get("drop") or [])]
+    if source_schema is None:
+        if drop:
+            raise SystemExit("[columns].drop on route \"reimport\": the source has no dataset/_common_metadata to filter")
+        return None
+    ids = c.get("id") or []
+    needed = {"[columns].id": [ids] if isinstance(ids, str) else list(ids),
+              "[columns].default": [d.split(".")[0] for d in (c.get("default") or [])],
+              "[columns].sort": sort_columns(cfg), "[index].columns": list(cfg["index"].get("columns") or []),
+              "spatial index, ra, dec": [SPATIAL_INDEX_COLUMN, cat.catalog_info.ra_column, cat.catalog_info.dec_column]}
+    clash = {k: [x for x in v if x in drop] for k, v in needed.items()}
+    clash = {k: v for k, v in clash.items() if v}
+    if clash:
+        raise SystemExit(f"[columns].drop removes columns that are still needed: {clash}")
+    src = source_schema.names
+    unknown = [d for d in drop if d not in src]
+    if unknown:
+        print(f"note: [columns].drop names columns the source does not have: {unknown}")
+    names = [n for n in src if n not in HIVE_COLUMNS and n not in drop]
+    if SPATIAL_INDEX_COLUMN in names:
+        names = [SPATIAL_INDEX_COLUMN] + [n for n in names if n != SPATIAL_INDEX_COLUMN]
+    return names
+
+
+def reimport_schema_file(cfg, source_path: str, source_schema, names) -> str:
+    """The use_schema_file for the reimport route. hats-import's reduce step reads each pixel with this schema
+    (pyarrow read_table(schema=...)): a column in the schema but not in the rows comes back all-null, and the
+    schema's column order is the written order. So when the source _common_metadata has columns the reader no longer
+    reads (Norder/Dir/Npix, [columns].drop), a different order, or pandas metadata (stale: it names the source's
+    columns and index, e.g. __index_level_0__), a filtered copy is written to <work_dir>/reimport_schema.parquet
+    (an empty table with that schema) and used instead of the source's file."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if source_schema is None or names is None:
+        return source_path
+    metadata = {k: v for k, v in (source_schema.metadata or {}).items() if k != b"pandas"}
+    target = pa.schema([source_schema.field(n) for n in names], metadata=metadata or None)
+    if target.names == source_schema.names and (target.metadata or {}) == (source_schema.metadata or {}):
+        return source_path
+    out = cfg.work_dir / "reimport_schema.parquet"
+    pq.write_table(target.empty_table(), out)
+    removed = [n for n in source_schema.names if n not in names]
+    kept_order = [n for n in source_schema.names if n in names]
+    print(f"reimport schema: {out} ({len(names)} columns; removed {removed}"
+          + ("; _healpix_29 moved first" if kept_order != names else "")
+          + ("; pandas metadata dropped" if b"pandas" in (source_schema.metadata or {}) else "") + ")")
+    return str(out)
+
+
 def reimport_kwargs(cfg, cat, files: list[str]) -> dict:
     """The arguments ImportArguments.reimport_from_hats builds (hats-import guide/reimporting), as keywords for
-    CollectionArguments.catalog(), with [partitioning], [columns].sort, the writer and the run's properties applied.
-    Rows are read back from the existing Parquet files; the existing _healpix_29 is reused, not recomputed, and
-    [columns].sort is not applied (hats-import does not allow sort columns together with use_healpix_29)."""
+    CollectionArguments.catalog(), with [partitioning], [columns].drop, the writer and the run's properties applied.
+    Rows are read back from the existing Parquet files; the existing _healpix_29 is reused, not recomputed.
+
+    [columns] on this route: ra / dec are informational (the source's hats_col_ra / hats_col_dec are used);
+    `drop` applies (removed from the reader's column list and from the schema file, together with the hipscat-era
+    Norder/Dir/Npix); `id` and `default` are written to the properties and must survive `drop`; `sort` is not applied
+    (hats-import refuses sort columns together with use_healpix_29) but must survive `drop`; `rename` and `cast` are
+    refused (the rows keep the source's names and types). Column order: _healpix_29 first, the rest in source order."""
     import hats
-    from hats.io.paths import HIVE_COLUMNS
+    from hats.io import file_io
     from hats_import.catalog.file_readers.parquet import ParquetPyarrowReader
 
     p = cfg["partitioning"]
-    names = [n for n in cat.schema.names if n not in HIVE_COLUMNS] if cat.schema is not None else None
+    schema_path = str(hats.io.paths.get_common_metadata_pointer(cat.catalog_base_dir))
+    try:
+        source_schema = file_io.read_parquet_metadata(schema_path).schema.to_arrow_schema()
+    except FileNotFoundError:
+        source_schema = cat.schema
+    names = reimport_columns(cfg, cat, source_schema)
     kw = {
         "catalog_type": cat.catalog_info.catalog_type,
         "ra_column": cat.catalog_info.ra_column,
@@ -197,7 +283,7 @@ def reimport_kwargs(cfg, cat, files: list[str]) -> dict:
         "file_reader": ParquetPyarrowReader(column_names=names),
         "use_healpix_29": True,
         "add_healpix_29": False,
-        "use_schema_file": str(hats.io.paths.get_common_metadata_pointer(cat.catalog_base_dir)),
+        "use_schema_file": reimport_schema_file(cfg, schema_path, source_schema, names),
         "expected_total_rows": int(cfg["source"].get("expected_total_rows") or cat.catalog_info.total_rows),
         # no sort_columns: hats-import refuses them with use_healpix_29; rows keep the source's order within each
         # _healpix_29 value (the source was written sorted by its own sort columns)
@@ -210,7 +296,15 @@ def reimport_kwargs(cfg, cat, files: list[str]) -> dict:
         kw["byte_pixel_threshold"] = int(p["byte_pixel_threshold"])
     else:
         kw["pixel_threshold"] = int(p.get("pixel_threshold") or cat.catalog_info.hats_max_rows or 0) or 1_000_000
-    kw["addl_hats_properties"] = source_properties(cat) | properties_dict(cfg)
+    props = source_properties(cat) | properties_dict(cfg)
+    if names is not None:   # carried column lists must not name a column this route no longer writes
+        gone = {k: [c for c in str(props.get(k) or "").split() if c.split(".")[0] not in names]
+                for k in ("hats_cols_default", "hats_cols_sort", "hats_cols_survey_id")}
+        gone = {k: v for k, v in gone.items() if v}
+        if gone:
+            raise SystemExit(f"properties name columns the re-imported catalog will not have: {gone}; set them in "
+                             "[columns].default / [columns].id or [properties] (or keep the columns)")
+    kw["addl_hats_properties"] = props
     return kw
 
 
@@ -241,7 +335,9 @@ def source_properties(cat) -> dict:
     missing = [k for k in CARRIED_KEYS if k not in out]
     if missing:   # keys hats keeps in the catalog object rather than the files
         info = cat.catalog_info
-        extra = {"hats_cols_default": " ".join(info.default_columns or []), "hats_npix_suffix": info.npix_suffix}
+        extra = {"hats_cols_default": " ".join(info.default_columns or []), "hats_npix_suffix": info.npix_suffix,
+                 # pre-0.6 builds do not declare the spatial index; use_healpix_29 guarantees this column
+                 "hats_col_healpix": "_healpix_29", "hats_col_healpix_order": "29"}
         out |= {k: extra[k] for k in missing if extra.get(k)}
     return out
 
@@ -268,9 +364,12 @@ def collection_args(cfg, files: list[str], output_path: Path, name: str, catalog
         dask_n_workers=int(d.get("n_workers", 1)),   # the capped values when apply_dask_resources ran
         dask_threads_per_worker=int(d.get("threads_per_worker", 1)),
         simple_progress_bar=True,
-    ).catalog(output_artifact_name=catalog_name,
-              **(reimport_kwargs(cfg, reimport_source(cfg), files) if cfg["run"].get("route") == "reimport"
-                 else catalog_kwargs(cfg, files)))
+    )
+    kwargs = (reimport_kwargs(cfg, reimport_source(cfg), files) if cfg["run"].get("route") == "reimport"
+              else catalog_kwargs(cfg, files))
+    if trial:   # one trial file never holds the archive's row total; hats-import would stop after Binning
+        kwargs["expected_total_rows"] = 0
+    args = args.catalog(output_artifact_name=catalog_name, **kwargs)
     if not trial:
         margins = cfg["margins"]
         thresholds = [margins.get("default_arcsec", 10)] + list(margins.get("extra_arcsec") or [])
@@ -290,12 +389,17 @@ def describe(args) -> dict:
                   "lowest_healpix_order", "constant_healpix_order", "drop_empty_siblings", "expected_total_rows", "use_schema_file"):
             out["catalog"][k] = getattr(cat, k, None)
         out["catalog"]["file_reader"] = type(cat.file_reader).__name__
+        reader_columns = getattr(cat.file_reader, "column_names", None)
+        if reader_columns:
+            out["catalog"]["reader_columns"] = list(reader_columns)
         out["catalog"]["n_input_files"] = len(cat.input_paths)
     out["margins"] = [m.get("output_artifact_name") or m for m in args.margin_kwargs]
     out["margin_paths"] = list(args.margin_paths)
     out["default_margin"] = args.default_margin_name
     out["indexes"] = dict(args.index_paths)
     out["properties"] = args.addl_hats_properties
+    if cat is not None and getattr(cat, "addl_hats_properties", None):
+        out["catalog_properties"] = cat.addl_hats_properties   # the main catalog's own (reimport: the carried source keys)
     out["write_table_kwargs"] = args.write_table_kwargs
     out["row_group_kwargs"] = args.row_group_kwargs
     out["dask"] = {"n_workers": args.dask_n_workers, "threads_per_worker": args.dask_threads_per_worker,
@@ -307,7 +411,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="catalog.toml")
     ap.add_argument("--dry-run", action="store_true", help="resolve and print the arguments, do not import")
-    ap.add_argument("--trial-file", help="import this single input file into <build>/trial_<catalog> (no margins/indexes)")
+    ap.add_argument("--trial-file", help="import this single input file into <build>/trial_<catalog> (no margins/indexes; the expected file count and row total are not checked)")
     ap.add_argument("--client", help="address of an existing Dask scheduler (otherwise a local client is created)")
     ap.add_argument("--no-pypi", action="store_true", help="skip the newer-version lookup")
     ap.add_argument("--allow-oversized-inputs", action="store_true",
@@ -343,8 +447,8 @@ def main(argv=None) -> int:
     output_path.mkdir(parents=True, exist_ok=True)
 
     # the input-size pass: what one worker must hold, before anything starts; a re-import's inputs are partition
-    # files, not the archive's files, so [source].expected_files does not apply to them
-    inputs = input_size_report(cfg, files, check_expected_files=cfg["run"].get("route") != "reimport")
+    # files and a trial's input is one file, not the archive's files, so [source].expected_files does not apply
+    inputs = input_size_report(cfg, files, check_expected_files=not a.trial_file and cfg["run"].get("route") != "reimport")
     args = collection_args(cfg, files, output_path, name, catalog_name, trial=bool(a.trial_file))
     summary = describe(args)
     summary["inputs"] = inputs
@@ -361,7 +465,7 @@ def main(argv=None) -> int:
 
     phase = "trial-import" if a.trial_file else "import"
     runlog(cfg, "start", phase, f"{len(files)} input file(s)", inputs=inputs,
-           **{k: v for k, v in summary["catalog"].items() if k != "file_reader"})
+           **{k: v for k, v in summary["catalog"].items() if k not in ("file_reader", "reader_columns")})
     t0 = time.time()
     try:
         from dask.distributed import Client

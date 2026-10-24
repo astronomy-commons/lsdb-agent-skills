@@ -128,12 +128,17 @@ def write_pngs(catalog_path: Path, cfg) -> None:
     matplotlib.use("Agg")
     from hats.io import summary_file
 
-    if cfg["ancillary"].get("skymap_png", True):
-        summary_file.write_skymap_png(catalog_path)
-        print("skymap.png written")
-    if cfg["ancillary"].get("partition_info_png", True):
-        summary_file.write_partition_info_png(catalog_path)
-        print("partition_info.png written")
+    # hats' plotting helpers raise on degenerate maps (a trial build with one populated pixel gives LogNorm an
+    # empty range: "Invalid vmin or vmax"); a missing preview must not fail the ancillary step
+    for key, writer, name in (("skymap_png", summary_file.write_skymap_png, "skymap.png"),
+                              ("partition_info_png", summary_file.write_partition_info_png, "partition_info.png")):
+        if not cfg["ancillary"].get(key, True):
+            continue
+        try:
+            writer(catalog_path)
+            print(f"{name} written")
+        except Exception as exc:  # noqa: BLE001 - previews are optional; the README notes their absence
+            print(f"WARNING: {name} not written ({type(exc).__name__}: {exc}); a one-pixel or empty map cannot be drawn")
 
 
 def _human_bytes(n: int) -> str:
@@ -236,13 +241,21 @@ def write_docs(collection_path: Path, catalog_path: Path, cfg, versions: dict) -
     description = p.get("obs_description") or None
     env_url = os.environ.get("HATS_PUBLISH_WEB_URL")
     uri = f"{env_url}/{cfg['hosting'].get('web_link_name') or cfg['names'].get('public_name') or cfg['names']['collection']}" if env_url else None
+    failed = []
     for target in (collection_path, catalog_path):
-        if cfg["ancillary"].get("readme", True):
-            summary_file.write_catalog_summary_file(target, fmt="markdown", name=name, description=description, uri=uri)
-        if cfg["ancillary"].get("index_html", True):
-            summary_file.write_catalog_summary_file(target, fmt="html", name=name, description=description, uri=uri)
+        for key, fmt in (("readme", "markdown"), ("index_html", "html")):
+            if not cfg["ancillary"].get(key, True):
+                continue
+            try:
+                summary_file.write_catalog_summary_file(target, fmt=fmt, name=name, description=description, uri=uri)
+            except Exception as exc:  # noqa: BLE001 - hats' summary writer converts the schema to pandas; tz-aware
+                # timestamps (e.g. tz=utc) need pytz in the environment, and the failure must not end the run
+                failed.append(f"{target.name}/{fmt}: {type(exc).__name__}: {exc}")
         add_provenance(target, cfg, versions)
-    print("README.md / index.html with a Provenance section written for the collection and the catalog")
+    if failed:
+        print("WARNING: summary files not written: " + "; ".join(failed)[:400] + " (install pytz for tz-aware timestamp columns)")
+    else:
+        print("README.md / index.html with a Provenance section written for the collection and the catalog")
 
 
 def main(argv=None) -> int:

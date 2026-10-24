@@ -26,6 +26,12 @@ load_site_env
 W="${1:-$PWD}"
 cd "$W" || exit 1
 now=$(date +%s)
+# the config is read with the import environment's python; say so instead of printing "?" fields
+if [ ! -f catalog.toml ]; then
+    echo "status: no catalog.toml in $PWD: run from the work directory or pass it as the argument" >&2
+elif ! python -c "import sys; sys.path.insert(0, '$HERE'); import _common" 2>/dev/null; then
+    echo "status: '$(command -v python || echo python)' cannot import the templates (_common): activate the import environment" >&2
+fi
 
 if [ -f download.pid ]; then
     # a download started in the background records its pid there, e.g. `nohup <download command> & echo $! > download.pid`;
