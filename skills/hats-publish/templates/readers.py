@@ -23,6 +23,16 @@ dropped. Two optional per-chunk steps run inside the reader: `[reader].derive` (
 from the chunk and the input path, e.g. a region tag) and `[reader].pack_nested` (list columns packed into one
 struct-of-lists column that lsdb opens as a nested column).
 
+CSV missing values (`csv_na_defaults`, used by the import route and by the verification loader): pandas' default
+NA strings ("NA", "N/A", "NULL", "null", "None", "n/a", "#N/A", "<NA>", ...) are valid values in astronomical
+tables (a flag "NA", a class "None"), so unless `[reader].csv_kwargs` sets `keep_default_na`, `na_values` or
+`na_filter`, only an empty field and the float NaN spellings ("nan", "NaN", "NAN", "-nan", "-NaN") are missing.
+`check_csv_names` refuses column names that are not non-empty strings (a NaN name: pandas reads a column NAMED "NA"
+in a names/types side file as NaN, which leaves that column all-null in the catalog), type_map keys that are not
+columns, and a schema file whose columns differ from what the reader produces (the reduce step reads every pixel with
+that schema: a schema column the reader does not produce is written all-null, a reader column the schema lacks is
+dropped, both silently).
+
 ConformSchemaReader (`[reader].conform_schema`, a Parquet file, any input format) gives every chunk the same schema,
 so inputs that lack some columns (a region without a band) get all-null columns instead of a partition with a shorter
 schema, which hats-import's finishing step rejects. It runs after the column rules, so the target schema uses the
@@ -196,6 +206,55 @@ class ColumnRulesReader(InputReader):
 
     def regular_file_exists(self, input_file, **kwargs):
         return self.inner.regular_file_exists(input_file, **kwargs)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# CSV missing values and column names
+# ----------------------------------------------------------------------------------------------------------------
+CSV_NA_VALUES = ["", "nan", "NaN", "NAN", "-nan", "-NaN"]   # empty field and float NaN spellings only
+
+
+def csv_na_defaults(csv_kwargs: dict) -> dict:
+    """pandas.read_csv arguments with the skill's missing-value default: keep_default_na=False and
+    na_values=CSV_NA_VALUES, unless the user set keep_default_na, na_values or na_filter (then pandas' own rules apply
+    to what they set). Without the float NaN spellings a float column written as "nan" fails to parse with a type map
+    and silently becomes a string column without one."""
+    kw = dict(csv_kwargs or {})
+    if not {"keep_default_na", "na_values", "na_filter"} & kw.keys():
+        kw.update(keep_default_na=False, na_values=list(CSV_NA_VALUES))
+    return kw
+
+
+def check_csv_names(column_names=None, type_map=None, schema_names=None, drop=None, rename=None) -> list[str]:
+    """Problems with the CSV reader's names (empty list = fine): names that are not non-empty strings, duplicate
+    names, type_map keys that are not in column_names, and, with a schema file, schema columns the reader does not
+    produce (written all-null) or produced columns the schema lacks (dropped). Produced = column_names after
+    [columns].drop and rename; the spatial index column is ignored."""
+    problems = []
+    names = list(column_names or [])
+    bad = [n for n in names if not isinstance(n, str) or not n.strip()]
+    bad += [k for k in (type_map or {}) if not isinstance(k, str) or not k.strip()]
+    if bad:
+        problems.append(f"column names that are not non-empty strings: {bad!r} (a names/types side file read with pandas "
+                        "defaults turns a column named NA, N/A, NULL or None into NaN: read it with keep_default_na=False)")
+    dup = sorted({n for n in names if names.count(n) > 1}, key=str)
+    if dup:
+        problems.append(f"duplicate column names: {dup}")
+    if names and type_map:
+        unknown = [k for k in type_map if k not in names]
+        if unknown:
+            problems.append(f"[reader].type_map keys that are not in [reader].column_names: {unknown}")
+    if names and schema_names is not None:
+        drop, rename = set(drop or []), dict(rename or {})
+        produced = [rename.get(n, n) for n in names if n not in drop]
+        schema = [n for n in schema_names if n not in ("_healpix_29", "_hipscat_index")]
+        null = [n for n in schema if n not in produced]
+        lost = [n for n in produced if n not in schema]
+        if null:
+            problems.append(f"schema file columns the reader does not produce (they would be written all-null): {null}")
+        if lost:
+            problems.append(f"reader columns missing from the schema file (they would be dropped): {lost}")
+    return problems
 
 
 # ----------------------------------------------------------------------------------------------------------------

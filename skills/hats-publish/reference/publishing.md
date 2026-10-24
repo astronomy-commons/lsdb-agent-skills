@@ -22,7 +22,9 @@ differ, in `hats_status`, `hats_service_url` (each table's own directory URL on 
 ### Web host details
 
 The public URL `<HATS_PUBLISH_WEB_URL>/<name>` is a symlink in `<HATS_PUBLISH_WEB_ROOT>` pointing at the
-collection in the data store (as the data.lsdb.io README describes). The directory listing uses Apache's
+collection in the data store (as the data.lsdb.io README describes). The name may be nested in a group directory
+(`wise/allwise`): the script creates the group directory in the web tree if it is missing, and the data copy stays at
+`<survey>/<collection>`. The directory listing uses Apache's
 `AddDescription "<text>" <name> <name>/` lines in `.htaccess`; Apache takes the **first** matching line and matches
 names as prefixes, so a specific entry must come before any shorter entry that is a prefix of it, and the script
 inserts it there; an entry that already exists for the same name is replaced in place. The description is escaped
@@ -34,6 +36,15 @@ renamed, and restored from its backup if the read-back differs.
 For catalogs hosted by a partner (object storage at a data centre), hand over: the collection directory with its
 checksum manifest, the README, the intended public name, the `hats_service_url` the partner will serve, and the
 page entry text. Ask the partner for the final URL and record it in `[registry].mirrors` (informational) and on the page.
+
+### Fan-out after a re-import
+
+Every copy of a catalog must be refreshed after a re-import: the web store, the mirror, and any further internal or
+partner copies listed in `[registry].mirrors`. A copy left on the old version serves other rows, columns or encodings
+under the same name. Write one checklist line per target in `NOTES.md` (target, path or URL, `hats_status` word,
+date refreshed, verification result) and close the run only when every line is ticked. `hats_status` is `main` on
+the primary copy and `mirror` on every other copy, and `hats_service_url` is each copy's own URL; the publish scripts
+set both, and a copy made by hand or by a partner needs them set by hand.
 
 ## The data.lsdb.io page
 
@@ -83,3 +94,17 @@ clone, fails when the XML was not rendered, and shows the staged diff; the pull 
 
 Keep the old copy until the page and the registry point at the new one and users have had a notice period. Then
 remove the symlink first, the data second, and update the page notes.
+
+## Retiring a catalog
+
+When a catalog is withdrawn with no replacement at the same name:
+
+1. Add a `warning` banner to the page `notes` with the retirement date and the replacement, if any; deploy it and
+   keep it up for at least two weeks.
+2. Remove the web symlink and its `AddDescription` line in `.htaccess`.
+3. Delete the copies on every target: the web data store, the mirror, and every copy in `[registry].mirrors`
+   (partners delete their own; record their confirmation).
+4. Remove the page entry from the data.lsdb.io `data/` tree (`scripts/update_index.py`) and regenerate the registry;
+   the generator marks the missing resource deleted. Its identifier cannot be reused.
+5. Keep a tombstone note in the import archive (`imports/README.md`): the catalog, the date, the reason, the
+   replacement, and where the import notebooks stay archived.

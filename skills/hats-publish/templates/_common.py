@@ -89,10 +89,16 @@ def load_config(path: str | Path = "catalog.toml") -> Config:
         if not cfg["names"].get(key):
             raise SystemExit(f"[names].{key} is required in {path}")
     for key, value in [("names.collection", cfg["names"]["collection"]), ("names.catalog", cfg["names"]["catalog"]),
-                       ("names.public_name", cfg["names"].get("public_name") or cfg["names"]["collection"]),
-                       ("run.survey", cfg["run"]["survey"]), ("hosting.web_link_name", cfg["hosting"].get("web_link_name") or "x")]:
+                       ("run.survey", cfg["run"]["survey"])]:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", str(value)):
             raise SystemExit(f"[{key}] may only contain letters, digits, '.', '_' and '-': {value!r}")
+    # the public link may be nested in a group directory of the web tree (e.g. "<group>/<catalog>")
+    for key, value in [("names.public_name", cfg["names"].get("public_name") or cfg["names"]["collection"]),
+                       ("hosting.web_link_name", cfg["hosting"].get("web_link_name") or "x")]:
+        parts = str(value).split("/")
+        if not all(re.fullmatch(r"[A-Za-z0-9._-]+", s) and s not in (".", "..") for s in parts):
+            raise SystemExit(f"[{key}] must be '/'-separated names of letters, digits, '.', '_' and '-' "
+                             f"(no empty, '.' or '..' parts): {value!r}")
     return cfg
 
 
@@ -202,13 +208,53 @@ def require_env(*names: str) -> dict:
 # ----------------------------------------------------------------------------------------------------------------
 # writer settings and properties
 # ----------------------------------------------------------------------------------------------------------------
-def writer_kwargs(cfg: Config) -> dict:
+HIVE_LEAVES = ("Norder", "Dir", "Npix")   # columns hats-import adds to index tables (and old catalogs carry)
+
+
+def schema_leaves(schema: pa.Schema) -> list[tuple[str, bool]]:
+    """(Parquet leaf path, is_float) for every leaf of an Arrow schema, with Parquet's path spelling ("a.list.element",
+    "s.x", "m.key_value.key") - the names use_dictionary and column_encoding take."""
+    import pyarrow as pa
+
+    out: list[tuple[str, bool]] = []
+
+    def walk(path: str, t) -> None:
+        if pa.types.is_dictionary(t):
+            t = t.value_type
+        if pa.types.is_struct(t):
+            for i in range(t.num_fields):
+                walk(f"{path}.{t.field(i).name}", t.field(i).type)
+        elif pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+            walk(f"{path}.list.element", t.value_type)
+        elif pa.types.is_map(t):
+            walk(f"{path}.key_value.key", t.key_type)
+            walk(f"{path}.key_value.value", t.item_type)
+        else:
+            out.append((path, pa.types.is_floating(t)))
+
+    for field in schema:
+        walk(field.name, field.type)
+    return out
+
+
+def writer_kwargs(cfg: Config, schema: pa.Schema | None = None) -> dict:
     """Departures from the hats Parquet defaults listed in [writer]; passed as write_table_kwargs to hats-import
     and lsdb, which merge them over the defaults (empty for a standard run).
 
     The defaults (hats >= 0.11.1, hats.io.file_io.get_parquet_write_table_kwargs, hats#742) are the team standard:
     ZSTD level 15, page index, statistics, BYTE_STREAM_SPLIT on every float leaf, DELTA_BINARY_PACKED on
-    _healpix_29 and on an integer leading sort column, dictionary on the rest, 100 000-row row groups."""
+    _healpix_29 and on an integer leading sort column, dictionary on the rest, 100 000-row row groups.
+
+    [writer].use_dictionary and [writer].row_group_size are what choose_encoding.py measures and writes.
+    row_group_size reaches pq.write_table (the skill's own files, hats-import margins and indexes); hats-import and
+    lsdb drop it for catalog partitions, which take their row groups from row_group_kwargs() instead.
+
+    use_dictionary decides the FLOAT leaves only: a non-float leaf missing from the list would otherwise lose its
+    dictionary (pyarrow encodes only the listed leaves). So the list is extended with Norder/Dir/Npix (index tables
+    and stray hive columns; names absent from a table are ignored by pyarrow) and, when `schema` is given (the table
+    about to be written), with every non-float leaf of that schema except _healpix_29 and [writer].column_encoding
+    leaves. hats-import receives one list for the catalog, margins and indexes without a schema, so a hand-written
+    list must still name the catalog's non-float leaves (choose_encoding.py writes them all)."""
     w = cfg["writer"]
     if w.get("use_byte_stream_split"):
         raise SystemExit("[writer].use_byte_stream_split is obsolete: hats >= 0.11.1 writes every float column "
@@ -217,22 +263,47 @@ def writer_kwargs(cfg: Config) -> dict:
     if "compression_level" in out:
         out["compression_level"] = int(out["compression_level"])
     # an empty list would mean "no dictionary on any column" to hats, not "use the defaults"
-    if w.get("use_dictionary"):
-        out["use_dictionary"] = list(w["use_dictionary"])
     if w.get("column_encoding"):
         out["column_encoding"] = dict(w["column_encoding"])
+    if w.get("use_dictionary"):
+        listed = list(w["use_dictionary"])
+        pinned = set(out.get("column_encoding") or {}) | {"_healpix_29"}
+        extra = [c for c in HIVE_LEAVES if c not in pinned]
+        if schema is not None:
+            extra += [path for path, is_float in schema_leaves(schema) if not is_float and path not in pinned]
+        out["use_dictionary"] = listed + [c for c in dict.fromkeys(extra) if c not in set(listed)]
+    if w.get("row_group_size"):
+        out["row_group_size"] = writer_row_group_size(cfg)
     return out
+
+
+def writer_row_group_size(cfg: Config) -> int:
+    """[writer].row_group_size as a positive int, 0 when unset."""
+    value = cfg["writer"].get("row_group_size") or 0
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise SystemExit(f"[writer].row_group_size must be a whole number of rows: {value!r}") from None
+    if value < 0:
+        raise SystemExit(f"[writer].row_group_size must be positive: {value}")
+    return value
 
 
 def parquet_write_kwargs(cfg: Config, schema: pa.Schema) -> dict:
     """Full pyarrow.parquet.write_table keyword arguments for a table the skill writes itself: the hats defaults
-    for this schema with the [writer] overrides, the same settings hats-import uses for the partitions."""
+    for this schema with the [writer] overrides, the same settings hats-import uses for the partitions
+    (row_group_size = [writer].row_group_size when set, else the hats default of 100 000 rows)."""
     from hats.io.file_io.file_io import get_parquet_write_table_kwargs
 
-    return get_parquet_write_table_kwargs(schema, write_table_kwargs=writer_kwargs(cfg))
+    return get_parquet_write_table_kwargs(schema, write_table_kwargs=writer_kwargs(cfg, schema))
 
 
 def row_group_kwargs(cfg: Config) -> dict | None:
+    """hats-import's row_group_kwargs for the catalog partitions. [writer].row_group_size, when set, takes
+    precedence over [partitioning].row_groups and becomes {"num_rows": N}: hats-import splits the partitions
+    itself and drops row_group_size from the writer arguments, so this is how that setting reaches them."""
+    if writer_row_group_size(cfg):
+        return {"num_rows": writer_row_group_size(cfg)}
     rg = cfg["partitioning"].get("row_groups") or {}
     strategy = rg.get("strategy", "subtile_order_delta")
     if strategy == "single":

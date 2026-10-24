@@ -44,7 +44,8 @@ import lsdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    apply_dask_resources, check_versions, load_config, pin_cpus, properties_dict, read_properties, runlog, writer_kwargs,
+    apply_dask_resources, check_versions, load_config, pin_cpus, properties_dict, read_properties, row_group_kwargs, runlog,
+    writer_kwargs,
 )
 
 
@@ -136,7 +137,7 @@ def main(argv=None) -> int:
             default_columns=nested_defaults or None, addl_hats_properties=props,
             skymap_alt_orders=list(cfg["partitioning"].get("skymap_alt_orders") or []) or None,
             create_thumbnail=False, create_per_partition_statistics=True, create_summary=False,
-            write_table_kwargs=writer_kwargs(cfg),
+            write_table_kwargs=writer_kwargs(cfg), row_group_kwargs=row_group_kwargs(cfg),   # lsdb drops row_group_size
         )
     reopened = lsdb.open_catalog(fine)
     rows = reopened.hc_structure.catalog_info.total_rows

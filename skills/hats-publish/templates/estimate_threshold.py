@@ -27,7 +27,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import check_versions, input_files, load_config, pin_cpus, runlog, parquet_write_kwargs  # noqa: E402
+from _common import (  # noqa: E402
+    check_versions, input_files, load_config, parquet_write_kwargs, pin_cpus, row_group_kwargs, runlog,
+)
 
 MB = 10**6   # file sizes in this script and in [partitioning].target_file_mb
 
@@ -75,8 +77,8 @@ def metadata_estimate(cfg, sample: pa.Table, total_rows: int, threshold: int) ->
             sizes[groups] = pq.read_metadata(out).serialized_size
     per_group = max((sizes[4] - sizes[1]) / 3, 1)
     partitions = expected_partitions(total_rows, threshold)
-    rg = (cfg["partitioning"].get("row_groups") or {})
-    strategy, value = rg.get("strategy", "subtile_order_delta"), rg.get("value", 1)
+    rgk = row_group_kwargs(cfg)   # [writer].row_group_size when set ({"num_rows": N}), else [partitioning].row_groups
+    strategy, value = (next(iter(rgk.items())) if rgk else ("single", 0))
     if strategy == "subtile_order_delta":
         groups_per_file = 4 ** int(value)
     elif strategy == "num_rows":
@@ -93,7 +95,7 @@ def metadata_estimate(cfg, sample: pa.Table, total_rows: int, threshold: int) ->
         if create:
             lines.append("  WARNING: the catalog's _metadata would come close to or over the 4 GiB limit and the finishing step "
                          "would fail after the whole import. Set [writer].create_metadata = false (verification then works "
-                         "from the file footers), or use fewer row groups per file ([partitioning].row_groups).")
+                         "from the file footers), or use fewer row groups per file ([writer].row_group_size or [partitioning].row_groups).")
         else:
             lines.append("  [writer].create_metadata = false: no _metadata will be written; this is the right setting here.")
     elif not create:

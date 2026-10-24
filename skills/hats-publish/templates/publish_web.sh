@@ -249,6 +249,10 @@ $SSH "$DATA_HOST" "python3 - '$DEST' '$CATALOG' '$STATUS' '$PUBLIC'" <<< "$STAMP
 
 step "e. symlink $HATS_PUBLISH_WEB_ROOT/$LINK -> $DEST_ON_WEB"
 PREV=$($SSH "$WEB_HOST" "readlink '$HATS_PUBLISH_WEB_ROOT/$LINK' 2>/dev/null || true")
+if [ "${LINK%/*}" != "$LINK" ]; then   # a nested link (group/name): its group directory must exist in the web tree
+  PARENT="$HATS_PUBLISH_WEB_ROOT/${LINK%/*}"
+  $SSH "$WEB_HOST" "[ -d '$PARENT' ] || { mkdir -p -m 2775 '$PARENT'${WEB_GROUP:+ && chgrp '$WEB_GROUP' '$PARENT'}; }"
+fi
 $SSH "$WEB_HOST" "test -d '$DEST_ON_WEB' && ln -sfn '$DEST_ON_WEB' '$HATS_PUBLISH_WEB_ROOT/$LINK' && ls -l '$HATS_PUBLISH_WEB_ROOT/$LINK'"
 revert() {   # point the public name back to where it pointed before this run
   if [ -n "$PREV" ] && [ "$PREV" != "$DEST_ON_WEB" ]; then

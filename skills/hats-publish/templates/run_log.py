@@ -52,6 +52,10 @@ def _kv(pairs: list[str] | None) -> dict:
 
 
 def _append(entry: dict) -> None:
+    # a log written next to no catalog.toml is a log nobody finds: refuse instead of creating it in a stray directory
+    if "HATS_PUBLISH_RUNLOG" not in os.environ and not (LOG.parent / "catalog.toml").exists():
+        raise SystemExit(f"run_log.py: no catalog.toml next to {LOG.resolve()}: run from the work directory "
+                         "(or set HATS_PUBLISH_RUNLOG)")
     entry = {"ts": _now()} | entry
     with LOG.open("a") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")

@@ -38,8 +38,9 @@ Phases in order. **Bold** steps stop and wait for the user. Each phase starts an
 (`run_log.py start|end <phase>`); the templates do this themselves where they run.
 
 0. **Environment.** Create or update an environment with the newest released `hats`, `lsdb`, `hats-import`
-   (`pip install -U hats lsdb hats-import nested-pandas pyarrow astropy fitsio jupyter`), print the versions, skim the
-   release notes for format changes. Point `HATS_PUBLISH_SITE_ENV` at your site file (`CONFIG.md`). The templates that use the
+   (`pip install -U hats lsdb hats-import nested-pandas pyarrow astropy fitsio jupyter pytz tzdata`; hats' summary
+   writer needs `pytz` for time-zone-aware timestamp columns), print the versions, skim the release notes for format
+   changes. Point `HATS_PUBLISH_SITE_ENV` at your site file (`CONFIG.md`). The templates that use the
    libraries refuse to run below the minimum versions and warn when a newer release exists.
 1. **Decision interview** (`reference/decisions.md`): the nine groups, a few questions at a time, each with its
    recommended default and consequences. Write the answers into `catalog.toml` and the run log
@@ -61,9 +62,20 @@ Phases in order. **Bold** steps stop and wait for the user. Each phase starts an
 3. Plan partitioning. `estimate_threshold.py --write` samples the input with the run's writer settings and
    converts the 200–800 MB file-size rule into `pixel_threshold`, and predicts the partition count and the size of
    `dataset/_metadata` (warns near the 4 GiB footer limit); check `highest_order` against the densest region.
-4. Trial. `import_collection.py --trial-file <one file>` into a trial directory; inspect dtypes, nulls versus
-   sentinels, column names, array columns, rows without coordinates (`[reader].drop_rows_without_coordinates`
-   drops and counts them). Adjust `[reader]`, `[columns]` and `[properties]`; **show the user what changed**.
+4. Trial. `import_collection.py --trial-file <one file>` into `<build_root>/trial_<collection>/trial_<catalog>` (the
+   script prints the path); inspect dtypes, nulls versus sentinels, column names, array columns, rows without
+   coordinates (`[reader].drop_rows_without_coordinates` drops and counts them). Verify the trial with
+   `verify_structure.py --trial --collection <trial collection>` and, for a re-import, compare it with the old version
+   with `compare_versions.py --trial`; the gaps a trial is expected to have (thumbnail, per-partition statistics,
+   margins, indexes) are reported as WARN, the data checks keep their full strength. Adjust `[reader]`, `[columns]`
+   and `[properties]`; **show the user what changed**.
+   Then `choose_encoding.py` on a trial partition (or `--file` on one or two real partitions of at least ~100 000
+   rows; re-imports default to `[run].reimport_from`). It writes the partition with dictionary and with
+   BYTE_STREAM_SPLIT, keeps per float column the smaller encoding, checks the round trip, and recommends 100 000-row
+   row groups (BYTE_STREAM_SPLIT-dominated) or 250 000 (dictionary-dominated). Show the user the summary (largest
+   columns, sizes against the hats default), then `--write` sets `[writer].use_dictionary` and `row_group_size`.
+   Never ship the raw default unchecked: BYTE_STREAM_SPLIT inflates low-cardinality floats 2–6×, and catalogs from
+   archive CSV exports get 1.3–2.5× larger with it.
 5. Import. `import_collection.py` detached (`nohup`/`setsid`), or `job.sbatch` on a batch node (it also runs
    phases 5–6 and the comparison), resumable; it builds the catalog, the
    margin(s) and the index tables with the `[properties]` and `[writer]` settings. Small tables (under about 1 M rows
@@ -101,10 +113,13 @@ Phases in order. **Bold** steps stop and wait for the user. Each phase starts an
     version); `run_log.py feedback` with the user for what was unclear, manual or wrong in the defaults;
     `run_log.py render --scrub` and offer a pull request adding the log to `runlogs/` in this repository.
 
-Re-imports: `ImportArguments.reimport_from_hats` for new thresholds or sorting, rebuild margins and indexes, write
-to a new directory, verify, run `compare_versions.py --new <new> --old <previous> --key <id>` (schema, rows and
-values of the shared region; type narrowing is reported separately), repoint the symlinks, keep the old copy
-until the page and registry point to the new one.
+Re-imports: `route = "reimport"` (`ImportArguments.reimport_from_hats` semantics) for new thresholds, writer
+settings or dropped columns, rebuild margins and indexes, write to a new directory, verify, run
+`compare_versions.py --new <new> --old <previous> --key <id>` (schema, rows and values of the shared region; type
+narrowing is reported separately; `[run].expect_differences` when the new version fixes the old one), refresh every
+copy, repoint the symlinks, keep the old copy until the page and registry point to the new one. What the route
+carries and rewrites, and how to trial a catalog you hold only remotely or in part: `reference/import.md`,
+"Re-importing an existing HATS catalog".
 
 ## Templates
 
@@ -114,6 +129,7 @@ until the page and registry point to the new one.
 | `pin_templates.sh` | freeze the templates for one run in `templates.pinned/` (commit, local diff, checksums); `--repin` to change them |
 | `_common.py`, `catalog_source.py`, `readers.py` | shared helpers: config, versions, site variables, writer settings, properties, source loader, coordinate filter |
 | `estimate_threshold.py` | file-size rule → `pixel_threshold` |
+| `choose_encoding.py` | per-column dictionary vs BYTE_STREAM_SPLIT and row-group size from a trial partition → `[writer]` |
 | `import_collection.py` | hats-import collection build (`--dry-run`, `--trial-file`) |
 | `import_small.py` | in-memory route for small tables |
 | `attach_positions.py` | positions by id from a reference HATS for tables without coordinates; ECSV arrays parsed into list columns |
@@ -138,9 +154,13 @@ One line each; details and more in `reference/pitfalls.md`.
 - Rows without coordinates stop the mapping stage: trial-import first, filter and count them.
 - Gzipped CSV inputs need `compression="gzip"` (the reader gets an open handle); the import adds it for `.gz` files.
 - `expected_total_rows` must match or the pipeline stops after binning; it is a check, not a hint.
-- Use the hats Parquet defaults (hats, hats-import, lsdb >= 0.11.1): ZSTD 15, page index, BYTE_STREAM_SPLIT on
-  float columns. Leave `[writer]` empty unless the user decides otherwise; write any file the skill writes itself with
-  `parquet_write_kwargs`. Older versions write floats dictionary-encoded, about 1.4× larger.
+- Start from the hats Parquet defaults (hats, hats-import, lsdb >= 0.11.1): ZSTD 15, page index, BYTE_STREAM_SPLIT
+  on float columns. BYTE_STREAM_SPLIT inflates low-cardinality floats 2–6×: `choose_encoding.py` sets
+  `[writer].use_dictionary` and `row_group_size` from a trial partition. Leave the other `[writer]` keys empty unless
+  the user decides otherwise; write any file the skill writes itself with `parquet_write_kwargs`.
+- CSV: only an empty field and the NaN spellings are missing values. A names/types side file read with pandas
+  defaults turns a column named `NA` into NaN: read it with `keep_default_na=False`.
+- `use_schema_file` decides the written columns: a schema column the reader does not produce is written all-null.
 - Default columns must exist in the schema; nested columns use `frame.subcol`.
 - hats writes `hats.properties` and `properties`; edit both or neither.
 - `hats_release_date` is the HATS note's date, not the data's; put data dates in `t_min`/`t_max`.

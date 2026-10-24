@@ -87,5 +87,5 @@ Target keys other than `web` and `mirror` (for example a partner object-storage 
 | `fitsio` | any current | row-parallel companion FITS files, derived and packed columns, bounded row-range reads in sampled verification |
 | `jupyter`, `nbconvert`, `nbformat` | any current | executing the verification notebook |
 
-Install the newest releases into a fresh environment (`pip install -U hats lsdb hats-import nested-pandas pyarrow
+Install the newest releases into a fresh environment (`pip install -U hats lsdb hats-import nested-pandas pyarrow pytz tzdata
 astropy fitsio jupyter`). Every template checks these minimums and warns when a newer release exists on PyPI.

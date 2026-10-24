@@ -19,11 +19,43 @@ policy beyond the note's recommendations, a thumbnail, `partition_info.csv` and 
 identical, `hats_col_healpix` present and first, thumbnail present with the partition schema, VOParquet metadata
 consistent across partitions, margin and index back-pointers resolving, default columns existing, down-sampled
 skymaps present) and the Parquet encoding sweep: every column chunk of every data file uses the configured codec,
-the offset and column indexes are present when `write_page_index` is on, every float leaf is BYTE_STREAM_SPLIT and
+the offset index is present when `write_page_index` is on (a chunk with an offset index but no column index is
+counted as a note, not a failure: pyarrow omits the column index for pages full of NaN), every float leaf is BYTE_STREAM_SPLIT and
 `_healpix_29` is DELTA_BINARY_PACKED (the hats >= 0.11.1 defaults, unless `[writer]` overrides them), encodings and
 row-group counts are recorded, and the hats version in `hats_builder` matches the installed one. The compression level cannot be read from Parquet metadata, so it is
 taken from `[writer]` and recorded as provenance; `--spot-check` re-encodes one row group at the configured level
 and compares the size.
+
+It also checks for the defects found when the catalogs served from data.lsdb.io were audited (2026-10-23). The
+sampled checks read up to 3 partitions (the first, the median-size one and the last); a check that cannot run is
+reported as WARN "check skipped: <reason>".
+
+| Check | Result | What the defect means |
+|---|---|---|
+| `stray-columns` | FAIL | `Norder`/`Dir`/`Npix`/`_hipscat_index`/`__index_level_*` columns in the files (pre-0.5 hipscat builds); they clash with the hive keys of the path. |
+| `hive-read` | FAIL | a sampled file cannot be read with `pq.read_table(path)` or as a member of the hive-partitioned dataset ("Field Norder has incompatible types"). |
+| `pandas-index-metadata` | WARN | the `pandas` schema metadata declares a real index column, so `to_pandas()` moves that column into the index. |
+| `coordinate-dtype` | FAIL | `hats_col_ra`/`hats_col_dec` are float32 or narrower: sub-arcsecond precision is lost. |
+| `margin-schema-matches` | FAIL / WARN | margin column names (ignoring `margin_Norder/Dir/Npix`) differ from the catalog's (FAIL), or the names agree and a type or the order differs (WARN). |
+| `margin-pixels-subset` | WARN | the margin has pixels the catalog lacks (small margin files for empty catalog pixels; harmless). |
+| `default-margin-declared` | FAIL | `all_margins` is set but `default_margin` is not, so lsdb never loads a margin. |
+| `point-map-order` | WARN | `point_map.fits` above order 8: `open_catalog` rebuilds the MOC from it on every open (order 10 = 100 MB; order 12 ~95 s). The `skymap.fits` order is recorded only. |
+| `point-map-sum` | FAIL | a point map or skymap does not sum to `hats_nrows`. |
+| `sampled-duplicate-ids` | WARN / FAIL | repeated `hats_cols_survey_id` (else `[columns].id`) values; FAIL only for an object catalog above 0.1 % of sampled rows (source tables repeat ids legitimately). |
+| `sampled-all-null-columns` | WARN | columns null in every sampled row (null-typed columns are marked); often a dropped or mis-mapped source column. |
+| `sampled-sorted` | WARN | `_healpix_29` decreases within a partition (written by lsdb without sorting). |
+| `sampled-coordinates` | FAIL | non-finite or out-of-range ra/dec, or the recomputed `_healpix_29` differs from the stored one for more than 0.01 % of rows (float32 coordinates fail this). |
+| `properties-files-identical` | FAIL | `hats.properties` and `properties` differ; the message lists the drifting keys. |
+| `margins-present`, `indexes-present` | FAIL | fewer margins or index tables than `[margins]` and `[index]` configure. |
+
+`vocabulary:obs_regime` accepts a space-separated list ("Infrared Optical") as long as every word is in the vocabulary.
+
+The main catalog is taken from `hats_primary_table_url` in collection.properties, so a trial collection
+(`trial_<collection>/trial_<catalog>`) is verified without extra arguments. Pass `--trial` for a trial build
+(`import_collection.py --trial-file`, which writes no margins, indexes or thumbnail): `thumbnail-present`,
+`per-partition-statistics`, `skymap-alt-order`, `margins-present` and `indexes-present` then report WARN with
+"(trial build)" instead of FAIL. The data checks (stray columns, coordinates, duplicates, encodings) keep their full
+strength; the trial exists to catch those.
 
 Run it again on every hosted copy (hats-import recommends verification after copying); the publish scripts do so
 where Python is available and fall back to a checksum manifest otherwise.

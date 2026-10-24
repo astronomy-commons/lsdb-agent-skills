@@ -226,7 +226,9 @@ def load_source(cfg, files=None, max_rows: int | None = None):
 
             nested = {"name": pn["name"], "columns": nested_columns([n for n, _ in schema_expect], list(pn.get("columns") or []))}
     elif fmt in ("csv", "tsv", "indexed_csv"):
-        kw = dict(cfg["reader"].get("csv_kwargs") or {})
+        from readers import csv_na_defaults
+
+        kw = csv_na_defaults(cfg["reader"].get("csv_kwargs") or {})   # the import route's missing-value rule
         if fmt == "tsv":
             kw.setdefault("sep", "\t")
         kw.pop("compression", None)   # pandas infers it from the path here

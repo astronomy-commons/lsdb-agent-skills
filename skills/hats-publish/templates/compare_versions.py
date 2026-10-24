@@ -8,9 +8,13 @@ What it reports:
     or a kind change (anything else);
   * partitioning and writer: partition counts and orders, rows per partition, row groups, codec, page index,
     builder versions, default columns (old side: only the partitions that overlap the compared region);
-  * rows: for the compared sky region (the NEW catalog's partitions, restricted by --sample-pixels / --max-rows),
-    the number of rows on each side and the id sets (ids only in one side). The old side is read with a fine pixel
-    search, so only its rows inside the compared pixels count, whatever its partitioning;
+  * rows: for the compared sky region, the number of rows on each side and the id sets (ids only in one side).
+    The new side is the NEW catalog's partitions, restricted by --sample-pixels / --max-rows. The old side is
+    bounded by where those new rows are: the HEALPix pixels, at a fine order (the old catalog's deepest partition
+    order, at least 8, at most 12), that hold at least one new row, read with a fine pixel search. So only the old
+    partitions under those pixels are read, whatever the new partitioning: a one-file trial binned into one coarse
+    partition (order 0-2) does not pull in every old partition under that coarse pixel. Old rows in a fine pixel
+    where the new side has no row at all are not counted (the total row count is checked by verify_structure.py);
   * values: for the rows present on both sides (joined on the id column), per-column exact equality for
     integers/strings/booleans and, for floats, exact equality plus the maximum absolute and relative difference
     (so a float64 -> float32 cast shows up as a bounded relative difference rather than a failure);
@@ -21,11 +25,14 @@ What it reports:
 Usage:
     compare_versions.py --new <collection or catalog> --old <collection, catalog or URL> --key source_id
                         [--columns a,b,c] [--sample-pixels N] [--max-rows N] [--out compare_versions.csv]
-                        [--config catalog.toml]
+                        [--config catalog.toml] [--trial]
 The OLD side may be far larger than the new one: only the partitions overlapping the compared pixels are read.
+--trial (for the output of import_collection.py --trial-file) changes nothing in the comparison; it states that the
+compared region is the one trial partition, so ids only in old are expected to be zero only inside it.
 The report CSV (one row per column: schema change and value comparison) goes to --out, relative to the work
 directory of --config when that file exists, else to the current directory.
-Exit code: 0 identical, 3 identical up to type narrowing, 1 different (2 is argparse's usage error).
+Exit code: 0 identical, 3 identical up to type narrowing, 1 different (2 is argparse's usage error),
+4 = only expected differences with --expect-value-changes (columns, types or values differ; rows and ids are the same).
 """
 from __future__ import annotations
 
@@ -43,7 +50,7 @@ import pyarrow as pa
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import check_versions, load_config  # noqa: E402
 
-EXIT_IDENTICAL, EXIT_DIFFERENT, EXIT_NARROWED = 0, 1, 3
+EXIT_IDENTICAL, EXIT_DIFFERENT, EXIT_NARROWED, EXIT_EXPECTED = 0, 1, 3, 4
 
 
 def open_main(path: str):
@@ -143,7 +150,16 @@ def main(argv=None) -> int:
                          "until the budget is reached, so the two frames fit in memory whatever the column count")
     ap.add_argument("--out", default="compare_versions.csv",
                     help="report CSV (default compare_versions.csv in the work directory of --config, else the current directory)")
+    ap.add_argument("--expect-value-changes", action="store_true",
+                    help="the new version fixes the old one ([run].expect_differences): column, type and value differences "
+                         "are reported as expected (exit 4); different row sets or duplicate ids are still DIFFERENT (exit 1)")
+    ap.add_argument("--expect-removed-rows", action="store_true",
+                    help="the new version REMOVES rows of the old one on purpose (duplicates, rows without coordinates): ids only in "
+                         "old and a lower duplicate count are reported as expected (exit 4); ids only in new are still DIFFERENT (exit 1)")
     ap.add_argument("--config", default="catalog.toml", help="run configuration, used for the work directory and the version check")
+    ap.add_argument("--trial", action="store_true",
+                    help="--new is a one-file trial (import_collection.py --trial-file): same comparison, with a note that the "
+                         "region is that one trial partition and the old side is bounded by the trial's rows")
     a = ap.parse_args(argv)
 
     work_dir = Path.cwd()
@@ -182,11 +198,42 @@ def main(argv=None) -> int:
             print(f"row budget {a.max_rows:,}: comparing {len(kept)} of {len(new_pixels)} partitions ({total:,} rows); raise --max-rows for more")
         new_pixels = kept
     new_sel = new_cat.pixel_search(new_pixels)
-    # fine=True: the old side keeps only its rows inside the compared pixels, even when its partitions are coarser
-    old_sel = old_cat.pixel_search(new_pixels, fine=True)
 
     new_props = new_main.catalog_info.extra_dict() | {"hats_col_healpix": getattr(new_main.catalog_info, "healpix_column", None)}
     old_props = old_main.catalog_info.extra_dict() | {"hats_col_healpix": getattr(old_main.catalog_info, "healpix_column", None)}
+    keys = [k.strip() for k in a.key.split(",")]
+    missing_keys = [k for k in keys if k not in s_new or k not in s_old]
+    if missing_keys:
+        raise SystemExit(f"--key column(s) {missing_keys} are not on both sides")
+    # the spatial-index column is the frame index in lsdb, not a selectable column (older catalogs: _hipscat_index)
+    index_cols = {"_healpix_29", "_hipscat_index"} | {p.get("hats_col_healpix") for p in (new_props, old_props) if p.get("hats_col_healpix")}
+    cols = keys + [c for c in (a.columns.split(",") if a.columns else common) if c not in keys and c in common and c not in index_cols]
+    new_df = new_sel[cols].compute()   # read once: the rows, and below the fine pixels that bound the old side
+
+    # the old side: the fine pixels that hold at least one new row, not the new partitions (a trial's few rows sit in
+    # one coarse partition, and a fine search of that coarse pixel would load every old partition under it)
+    old_max_order = max((p.order for p in old_main.get_healpix_pixels()), default=0)
+    fine_order = min(max(old_max_order, 8), 12)
+    region, old_region = f"{len(new_pixels)} partitions of the new catalog", new_pixels
+    spatial = new_df.index.to_numpy() if new_df.index.name in index_cols and len(new_df) else None
+    if spatial is not None:
+        from hats.pixel_math.spatial_index import spatial_index_to_healpix
+
+        fine = np.unique(spatial_index_to_healpix(spatial.astype(np.int64), target_order=fine_order))
+        while len(fine) > 200_000 and fine_order > max(old_max_order, 0):   # keep the pixel list small
+            fine_order -= 1
+            fine = np.unique(fine >> 2)
+        old_region = [(fine_order, int(p)) for p in fine]
+        region += f"; old side bounded by the {len(old_region):,} order-{fine_order} pixels that hold a new row"
+    else:
+        print(f"note: the new frame's index is {new_df.index.name!r}, not a spatial index (or the region is empty): "
+              "the old side is bounded by the new partitions")
+    if a.trial:
+        print(f"trial: the compared region is the one trial partition ({len(new_pixels)} partition(s), {len(new_df):,} rows); "
+              "ids only in old count old rows inside the fine pixels the trial's rows occupy")
+    # fine=True: the old side keeps only its rows inside the compared pixels, even when its partitions are coarser
+    old_sel = old_cat.pixel_search(old_region, fine=True)
+
     for label, main_, sel, props in (("new", new_main, new_sel, new_props), ("old", old_main, old_sel, old_props)):
         pixels = list(sel.get_healpix_pixels())
         try:
@@ -197,21 +244,20 @@ def main(argv=None) -> int:
               f"order {props.get('hats_order')} | {len(main_.get_healpix_pixels())} partitions, {len(pixels)} in the compared region | "
               f"default cols {len((props.get('hats_cols_default') or '').split())} | writer {summary}")
 
-    keys = [k.strip() for k in a.key.split(",")]
-    missing_keys = [k for k in keys if k not in s_new or k not in s_old]
-    if missing_keys:
-        raise SystemExit(f"--key column(s) {missing_keys} are not on both sides")
-    # the spatial-index column is the frame index in lsdb, not a selectable column (older catalogs: _hipscat_index)
-    index_cols = {"_healpix_29", "_hipscat_index"} | {p.get("hats_col_healpix") for p in (new_props, old_props) if p.get("hats_col_healpix")}
-    cols = keys + [c for c in (a.columns.split(",") if a.columns else common) if c not in keys and c in common and c not in index_cols]
-    new_df = new_sel[cols].compute()
     old_df = old_sel[cols].compute()
-    print(f"rows in the compared region ({len(new_pixels)} partitions of the new catalog): new {len(new_df):,} | old {len(old_df):,}")
+    for k in keys:   # an array-valued id (e.g. SDSS OBJID as 5 integers) becomes a tuple, so it can be hashed and joined
+        if any(f(s_new[k]) for f in (pa.types.is_list, pa.types.is_large_list, pa.types.is_fixed_size_list)):
+            for df in (new_df, old_df):
+                df[k] = [None if v is None else tuple(np.asarray(v).tolist()) for v in df[k].to_numpy(dtype=object)]
+    print(f"rows in the compared region ({region}): new {len(new_df):,} | old {len(old_df):,}")
     k_new = set(map(tuple, new_df[keys].to_numpy().tolist())); k_old = set(map(tuple, old_df[keys].to_numpy().tolist()))
     print(f"ids only in new: {len(k_new - k_old):,} | only in old (within the region): {len(k_old - k_new):,} | in both: {len(k_new & k_old):,}")
     dup_new = int(new_df.duplicated(subset=keys).sum()); dup_old = int(old_df.duplicated(subset=keys).sum())
     print(f"duplicate ids within the region: new {dup_new:,} | old {dup_old:,}")
 
+    if dup_new or dup_old:   # a duplicated id would pair every copy with every other copy: values only for unique ids
+        print("values are compared on the ids that are unique on both sides (duplicated ids are counted above)")
+        new_df, old_df = new_df.drop_duplicates(subset=keys, keep=False), old_df.drop_duplicates(subset=keys, keep=False)
     both = new_df.merge(old_df, on=keys, suffixes=("_new", "_old"))
     rows = []
     for c in cols[len(keys):]:
@@ -238,6 +284,13 @@ def main(argv=None) -> int:
                         return bool(np.all((uf == vf) | (np.isnan(uf) & np.isnan(vf))))
                     return bool(np.array_equal(u, v))
                 ne = int(sum(1 for i in range(len(x)) if not _same(x[i], y[i])))
+            elif pa.types.is_struct(t):
+                # nested columns (lsdb hands one DataFrame per row): frame equality, NaN equal to NaN
+                def _same_nested(u, v):
+                    if not isinstance(u, pd.DataFrame) or not isinstance(v, pd.DataFrame):
+                        return (u is None and v is None) or (u == v) is True
+                    return u.reset_index(drop=True).equals(v.reset_index(drop=True))
+                ne = int(sum(1 for i in range(len(x)) if not _same_nested(x[i], y[i])))
             else:
                 ne = int(sum(1 for i in range(len(x)) if x[i] != y[i]))
             rows.append({"column": c, "n": len(both), "n_differ": ne, "max_abs_diff": np.nan, "max_rel_diff": np.nan,
@@ -259,20 +312,28 @@ def main(argv=None) -> int:
 
     n_only_new, n_only_old = len(k_new - k_old), len(k_old - k_new)
     reasons = []
+    expected = []   # differences a fixing re-import is meant to have (--expect-value-changes); rows must still agree
+    value_reasons = expected if a.expect_value_changes else reasons
     if only_new or only_old:
-        reasons.append(f"columns only in new {only_new}, only in old {only_old}")
+        value_reasons.append(f"columns only in new {only_new}, only in old {only_old}")
     not_narrowing = {c: change for c, (_, _, change) in type_diff.items() if change != "narrowing"}
     if not_narrowing:
-        reasons.append(f"type changes that are not narrowings: {not_narrowing}")
+        value_reasons.append(f"type changes that are not narrowings: {not_narrowing}")
     unexplained = sorted(set(diff.column) - set(explained.column))
     if unexplained:
-        reasons.append(f"values differ in {unexplained}")
-    if n_only_new or n_only_old:
-        reasons.append(f"row sets differ: {n_only_new:,} ids only in new, {n_only_old:,} only in old (within the compared region)")
+        value_reasons.append(f"values differ in {len(unexplained)} columns: {unexplained}")
+    if n_only_new:
+        reasons.append(f"row sets differ: {n_only_new:,} ids only in new (within the compared region)")
+    if n_only_old:
+        (expected if a.expect_removed_rows else reasons).append(
+            f"{n_only_old:,} ids only in old (within the compared region)" + (" - removed on purpose" if a.expect_removed_rows else ""))
     if dup_new != dup_old:
-        reasons.append(f"duplicate ids differ: new {dup_new:,}, old {dup_old:,}")
+        (expected if (a.expect_removed_rows and dup_new < dup_old) else reasons).append(
+            f"duplicate ids differ: new {dup_new:,}, old {dup_old:,}")
     if reasons:
-        verdict, code = "DIFFERENT: " + "; ".join(reasons), EXIT_DIFFERENT
+        verdict, code = "DIFFERENT: " + "; ".join(reasons + expected), EXIT_DIFFERENT
+    elif expected:
+        verdict, code = "EXPECTED DIFFERENCES (same rows and ids): " + "; ".join(expected), EXIT_EXPECTED
     elif type_diff:
         verdict, code = f"identical up to type narrowing ({sorted(type_diff)})", EXIT_NARROWED
     else:
