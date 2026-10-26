@@ -24,8 +24,9 @@
 #   - at most $HATS_PUBLISH_MAX_RESUBMITS resubmits (default 10).
 # Files in the work directory: resubmit_loop.log (also holds sbatch's error output), current_job.txt (the job being
 # watched), resubmit_opts.txt, loop.heartbeat (host:pid, rewritten every minute). A second loop refuses to start
-# while the heartbeat is younger than 3 minutes, on any node. Never edit this script while a loop runs (bash reads
-# it as it executes): stop it, edit, restart.
+# while the heartbeat is younger than 3 minutes, on any node, unless the heartbeat names this host and a pid that is
+# no longer alive (kill -0): the previous loop has exited, so a restart right after it does not wait out the
+# 3 minutes. Never edit this script while a loop runs (bash reads it as it executes): stop it, edit, restart.
 # The loop runs from ./templates.pinned, the run's frozen copy of the templates (pin_templates.sh, created here when
 # the first job has not created it yet), and resubmits that copy's job.sbatch.
 set -uo pipefail
@@ -65,7 +66,13 @@ log() { echo "$(date -u +%FT%TZ) $*" >> "$W/resubmit_loop.log"; }
 beat() { echo "$(hostname):$$" > "$HB"; }
 
 if [ -f "$HB" ] && [ $(( $(date +%s) - $(stat -c %Y "$HB") )) -lt 180 ]; then
-    log "another loop is alive ($(cat "$HB")); not starting"; exit 2
+    hb=$(cat "$HB" 2>/dev/null); hb_host=${hb%%:*}; hb_pid=${hb##*:}
+    # a recent heartbeat of an exited loop on this host does not block; another host's is judged by its age only
+    if [ "$hb_host" = "$(hostname)" ] && [[ "$hb_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$hb_pid" 2>/dev/null; then
+        log "heartbeat $hb is recent but that loop has exited (no pid $hb_pid on this host); starting"
+    else
+        log "another loop is alive ($hb); not starting"; exit 2
+    fi
 fi
 beat; sleep 5
 # two loops started at the same moment both pass the age check: the one whose heartbeat was overwritten stops

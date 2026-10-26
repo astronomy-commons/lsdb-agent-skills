@@ -25,6 +25,7 @@ Usage:
 ``--trial`` is for a trial build (``import_collection.py --trial-file``: no margins, indexes or ancillary files): the
 thumbnail, per-partition statistics, alternate skymap orders and the margin/index presence checks become WARN with
 "(trial build)"; every data check (stray columns, coordinates, duplicates, encodings) keeps its full strength.
+The row truth is then ``--truth-rows`` only (not ``[source].expected_total_rows``, which counts every input file).
 The main catalog is the collection's ``hats_primary_table_url`` (``[names].catalog`` only when collection.properties
 is absent), so a trial collection ``trial_<collection>/trial_<catalog>`` is found without extra arguments.
 
@@ -834,7 +835,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="catalog.toml")
     ap.add_argument("--collection", help="collection to verify (default: the build path from catalog.toml)")
-    ap.add_argument("--truth-rows", type=int, default=0, help="expected total rows (default [source].expected_total_rows)")
+    ap.add_argument("--truth-rows", type=int, default=0, help="expected total rows (default [source].expected_total_rows; none under --trial)")
     ap.add_argument("--truth-schema", help="parquet file whose schema is the truth (default: the catalog's _common_metadata)")
     ap.add_argument("--results-file", metavar="PATH",
                     help="CSV the results are appended to (default: verify_results.csv in the work directory); "
@@ -853,7 +854,9 @@ def main(argv=None) -> int:
         raise SystemExit(f"collection not found: {collection}")
     work_dir = cfg.work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
-    truth_rows = a.truth_rows or int(cfg["source"].get("expected_total_rows") or 0)
+    # a trial build holds one input file: [source].expected_total_rows is not its truth, so footers are checked against
+    # the properties / _metadata only, unless --truth-rows is given
+    truth_rows = a.truth_rows or (0 if a.trial else int(cfg["source"].get("expected_total_rows") or 0))
     # results of this run, and hats-import's own CSV next to them (named after --results-file, so a re-check of a
     # hosted copy with its own results file keeps the build's two files intact)
     out = Path(a.results_file).resolve() if a.results_file else work_dir / "verify_results.csv"

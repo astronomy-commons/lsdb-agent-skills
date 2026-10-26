@@ -6,7 +6,10 @@ Usage:
 
 In a clone of astronomy-commons/data.lsdb.io (HATS_PUBLISH_SITE_REPO or --repo) this script:
   1. refuses to run if tracked files have uncommitted changes;
-  2. creates or switches to a branch named after the catalog id, from the current HEAD (unless --no-branch);
+  2. creates or switches to a branch named after the catalog id (unless --no-branch). A new branch starts from the
+     remote's default branch after a fetch (origin/main, or what origin/HEAD names; the first remote when there is no
+     origin), never from whatever branch the clone happens to be on; only a clone without a remote branches from the
+     current HEAD. The base used is printed;
   3. writes data/<Group>/<Name>/catalog.json from [site] in catalog.toml, with the public URLs from the site
      variables and the metadata block computed from the LOCAL collection (not fetched from the URL). An existing
      entry is deep-merged: the keys this script produces are updated, every other key (extra URLs, mean maps,
@@ -97,6 +100,36 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=check).stdout.strip()
 
 
+def branch_base(repo: Path) -> str:
+    """The ref a new page branch starts from: <remote>/<default branch> after a fetch, or HEAD without a remote."""
+    remotes = git(repo, "remote").split()
+    if not remotes:
+        return "HEAD"
+    remote = "origin" if "origin" in remotes else remotes[0]
+    fetched = subprocess.run(["git", "-C", str(repo), "fetch", "-q", remote], capture_output=True, text=True)
+    if fetched.returncode:
+        print(f"warning: git fetch {remote} failed ({fetched.stderr.strip()[:200]}); using the last fetched state")
+    head = git(repo, "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD", check=False)
+    for ref in ([head] if head else []) + [f"{remote}/main", f"{remote}/master"]:
+        if git(repo, "rev-parse", "-q", "--verify", f"refs/remotes/{ref}", check=False):
+            return ref
+    raise SystemExit(f"remote {remote!r} has no default branch (no {remote}/HEAD, main or master): fetch it or pass --no-branch")
+
+
+def badge_list(badges) -> list[dict]:
+    """[site].badges as the page's [{"title": ...}] list; entries may be plain strings or { title = "..." } tables."""
+    out = []
+    for b in badges or []:
+        if isinstance(b, str):
+            if b.strip():
+                out.append({"title": b.strip()})
+        elif isinstance(b, dict) and str(b.get("title") or "").strip():
+            out.append(dict(b))
+        else:
+            raise SystemExit(f"[site].badges: {b!r} is neither a string nor a table with a title")
+    return out
+
+
 def local_metadata(collection: Path, catalog_name: str) -> dict:
     import pyarrow.parquet as pq
 
@@ -157,13 +190,16 @@ def main(argv=None) -> int:
         raise SystemExit(f"{repo} has uncommitted changes to tracked files; commit or stash them first")
     branch = a.branch or site["id"]
     if not a.no_branch:
-        current = git(repo, "branch", "--show-current")
-        if current != branch:
-            if git(repo, "branch", "--list", branch):
-                git(repo, "checkout", "-q", branch)
-            else:
-                git(repo, "checkout", "-q", "-b", branch)
-        print(f"on branch {branch} (from {current})")
+        current = git(repo, "branch", "--show-current") or "detached HEAD"
+        if current == branch:
+            print(f"on branch {branch} (already checked out)")
+        elif git(repo, "branch", "--list", branch):
+            git(repo, "checkout", "-q", branch)
+            print(f"on branch {branch} (existing branch; was on {current})")
+        else:
+            base = branch_base(repo)
+            git(repo, "checkout", "-q", "--no-track", "-b", branch, base)
+            print(f"on branch {branch} (new, from {base}" + (f" = {current}" if base == "HEAD" else "") + ")")
 
     collection = Path(a.collection).resolve() if a.collection else cfg.collection_path
     if not (collection / "collection.properties").exists():
@@ -193,7 +229,7 @@ def main(argv=None) -> int:
         "urls": urls,
         "metadata": local_metadata(collection, catalog_name),
         "other_urls": [u for u in site.get("other_urls", []) if u.get("url")],
-        "badges": [{"title": b} for b in site.get("badges", [])],
+        "badges": badge_list(site.get("badges")),
     }
     notes = [n for n in (site.get("notes") or []) if n.get("title") or n.get("content")]
     if notes:   # notes in catalog.toml replace the page's notes; no notes there keeps the page's own

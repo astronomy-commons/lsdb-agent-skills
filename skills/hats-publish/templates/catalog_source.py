@@ -14,6 +14,12 @@ array column holds one native-byte-order 1-D numpy array per row), csv / tsv / i
 parquet / indexed_parquet (pyarrow; its own schema). The indexed formats list their data files in index files, which
 are expanded here as hats-import does.
 
+Route "reimport" with [source].files empty: the source is the partition files of [run].reimport_from, read as the
+import reads them (Parquet whatever [source].format says; the import's column list: no Norder/Dir/Npix, no
+[columns].drop) and without the spatial index column, which the import writes first and the verification recomputes
+from the positions. [reader] options do not apply, as on the import. [source].files set: the files and [source].format
+are used as on the other routes (e.g. the original raw files, for a check against the archive rather than the old copy).
+
 Order of the steps, the same as the import route's reader chain: read (FITS keep-list or skip-list, companions,
 [reader].derive) -> [columns].drop / rename / cast -> [reader].strip_strings -> [reader].conform_schema ->
 [reader].drop_rows_without_coordinates (on the renamed coordinate columns).
@@ -167,7 +173,59 @@ def _read_fits(p, hdu: int, max_rows: int | None):
         return tbl.to_pandas(), schema
 
 
+def _read_parquet(paths, keep, max_rows):
+    """Parquet files -> (frames, [(column, Arrow type)]), list columns kept Arrow-backed; stops after max_rows."""
+    import pyarrow.parquet as pq
+
+    frames, schema_expect = [], None
+    for p in paths:
+        t = pq.read_table(p, columns=keep)
+        if schema_expect is None:
+            schema_expect = [(f.name, f.type) for f in t.schema]
+        frame = t.to_pandas()
+        for f in t.schema:   # keep list columns Arrow-backed (to_pandas would give object arrays of ndarrays)
+            if pa.types.is_list(f.type) or pa.types.is_large_list(f.type):
+                frame[f.name] = pd.array(t.column(f.name).combine_chunks(), dtype=pd.ArrowDtype(f.type))
+        frames.append(frame)
+        if max_rows and sum(len(f) for f in frames) >= max_rows:
+            break
+    return frames, schema_expect
+
+
+def reimport_rows(cfg) -> bool:
+    """True when the source rows are the partition files of [run].reimport_from (route "reimport", no [source].files)."""
+    return cfg["run"].get("route") == "reimport" and not (cfg["source"].get("files") or [])
+
+
+def _load_reimport(cfg, files, max_rows):
+    """The reimport route's rows: the import's column list without the spatial index, no [reader] steps."""
+    import pyarrow.parquet as pq
+    from hats.io.paths import HIVE_COLUMNS
+    from hats.pixel_math.spatial_index import SPATIAL_INDEX_COLUMN
+
+    from _common import reimport_source
+    from import_collection import reimport_read_columns
+
+    paths = list(files) if files else input_files(cfg)
+    names = reimport_read_columns(cfg, reimport_source(cfg))   # also refuses rename/cast and a drop of needed columns
+    if names is None:   # no _common_metadata: the first file's columns
+        names = [n for n in pq.read_schema(paths[0]).names if n not in HIVE_COLUMNS]
+    keep = [n for n in names if n != SPATIAL_INDEX_COLUMN]
+    frames, schema_expect = _read_parquet(paths, keep, max_rows)
+    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0].reset_index(drop=True)
+    if max_rows:
+        df = df.iloc[:max_rows].copy()
+    src = pq.read_schema(paths[0]).names
+    dropped = [c for c in src if c not in keep]   # Norder/Dir/Npix, [columns].drop and the spatial index
+    meta = {"rows": len(df), "files": [str(p) for p in paths], "format": "parquet", "strip_changed": {},
+            "source_columns": src, "dropped_no_coords": 0, "nested": None, "conformed": [],
+            "dropped": dropped, "renamed": {}, "cast": {}, "reimport_from": cfg["run"].get("reimport_from")}
+    return df, schema_expect, meta
+
+
 def load_source(cfg, files=None, max_rows: int | None = None):
+    if reimport_rows(cfg):
+        return _load_reimport(cfg, files, max_rows)
     fmt = cfg["source"]["format"]
     paths = [Path(f) for f in files] if files else input_files(cfg)
     if fmt in ("indexed_csv", "indexed_parquet"):
@@ -265,20 +323,8 @@ def load_source(cfg, files=None, max_rows: int | None = None):
             if max_rows and sum(len(f) for f in frames) >= max_rows:
                 break
     elif fmt in ("parquet", "indexed_parquet"):
-        import pyarrow.parquet as pq
-
         keep = list(cfg["reader"].get("column_names") or []) or None   # the import's Parquet keep-list
-        for p in paths:
-            t = pq.read_table(p, columns=keep)
-            if schema_expect is None:
-                schema_expect = [(f.name, f.type) for f in t.schema]
-            frame = t.to_pandas()
-            for f in t.schema:   # keep list columns Arrow-backed (to_pandas would give object arrays of ndarrays)
-                if pa.types.is_list(f.type) or pa.types.is_large_list(f.type):
-                    frame[f.name] = pd.array(t.column(f.name).combine_chunks(), dtype=pd.ArrowDtype(f.type))
-            frames.append(frame)
-            if max_rows and sum(len(f) for f in frames) >= max_rows:
-                break
+        frames, schema_expect = _read_parquet(paths, keep, max_rows)
     else:
         raise ValueError(f"unsupported [source].format {fmt!r}")
 
