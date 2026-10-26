@@ -177,13 +177,13 @@ fi
 # the files of the existing copy that the local collection does not have (rsync without --delete keeps them)
 LOCAL_LIST="$(mktemp)"; REMOTE_LIST="$(mktemp)"; MANIFEST="$(mktemp)"; ERR="$(mktemp)"
 trap 'rm -f "$LOCAL_LIST" "$REMOTE_LIST" "$MANIFEST" "$ERR"' EXIT
-(cd "$SRC" && find . -type f | sed 's|^\./||' | sort) > "$LOCAL_LIST"
+(cd "$SRC" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) > "$LOCAL_LIST"
 rc=0
-remote=$($SSH "$DATA_HOST" "if [ -d '$DEST' ]; then echo present; cd '$DEST' && find . -type f | sed 's|^\./||' | sort; else echo absent; fi" 2> "$ERR") || rc=$?
+remote=$($SSH "$DATA_HOST" "if [ -d '$DEST' ]; then echo present; cd '$DEST' && find . -type f | sed 's|^\./||' | LC_ALL=C sort; else echo absent; fi" 2> "$ERR") || rc=$?
 [ "$rc" -eq 0 ] || { echo "cannot list $DATA_HOST:$DEST (ssh exit $rc):" >&2; cat "$ERR" >&2; exit 1; }
 DEST_EXISTS=0; [ "$(head -1 <<< "$remote")" = "present" ] && DEST_EXISTS=1
 tail -n +2 <<< "$remote" | grep -v '^$' > "$REMOTE_LIST" || true
-EXTRA_N=$(comm -13 "$LOCAL_LIST" "$REMOTE_LIST" | wc -l)
+EXTRA_N=$(LC_ALL=C comm -13 "$LOCAL_LIST" "$REMOTE_LIST" | wc -l)
 
 if [ "$CHECK" -eq 1 ]; then
   step "check: rsync dry run $SRC -> $DATA_HOST:$DEST"
@@ -197,7 +197,7 @@ if [ "$CHECK" -eq 1 ]; then
   echo "files that would be transferred: $n of $(wc -l < "$LOCAL_LIST")"
   if [ "$DEST_EXISTS" -eq 1 ]; then
     echo "copy exists: $(wc -l < "$REMOTE_LIST") files; $EXTRA_N of them are not in the local collection"
-    [ "$EXTRA_N" -gt 0 ] && comm -13 "$LOCAL_LIST" "$REMOTE_LIST" | head -10 | sed 's/^/  extra: /' \
+    [ "$EXTRA_N" -gt 0 ] && LC_ALL=C comm -13 "$LOCAL_LIST" "$REMOTE_LIST" | head -10 | sed 's/^/  extra: /' \
       && echo "  --yes stops on these; --yes --replace deletes them"
   else
     echo "copy absent"
@@ -217,7 +217,7 @@ DELETE=()
 if [ "$EXTRA_N" -gt 0 ]; then
   if [ "$REPLACE" -eq 0 ]; then
     echo "$DATA_HOST:$DEST holds $EXTRA_N files that the local collection does not have, e.g.:" >&2
-    comm -13 "$LOCAL_LIST" "$REMOTE_LIST" | head -10 | sed 's/^/  /' >&2
+    LC_ALL=C comm -13 "$LOCAL_LIST" "$REMOTE_LIST" | head -10 | sed 's/^/  /' >&2
     echo "nothing was written. Re-run with --yes --replace to delete them, or publish under a new collection name." >&2
     exit 1
   fi
@@ -236,7 +236,7 @@ if [ -n "$WEB_GROUP" ]; then
 fi
 
 step "c. integrity: sha256 manifest"
-(cd "$SRC" && find . -type f | sort | sed 's|^\./||' | xargs -d '\n' sha256sum) > "$MANIFEST"
+(cd "$SRC" && find . -type f | LC_ALL=C sort | sed 's|^\./||' | xargs -d '\n' sha256sum) > "$MANIFEST"
 local_n=$(wc -l < "$MANIFEST")
 $SSH "$DATA_HOST" "cd '$DEST' && sha256sum -c --quiet -" < "$MANIFEST"
 remote_n=$($SSH "$DATA_HOST" "cd '$DEST' && find . -type f | wc -l")
