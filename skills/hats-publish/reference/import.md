@@ -202,6 +202,8 @@ The skill's reimport route (`route = "reimport"`, `reimport_from`) does the same
   `[index]` columns must survive the drop, and carried properties that name a removed column stop the run;
   `rename` and `cast` are refused (rows keep the source's names and types; re-import from the raw files to change them);
 - writes `_healpix_29` as the first column;
+- refuses to run while the source still has `_hipscat_index` or `__index_level_*` columns that `[columns].drop` does not
+  list (`verify_structure.py` fails a build that carries them); a leaked pandas index is normally a row number, check before dropping
 - rewrites the source `_common_metadata` to `<work_dir>/reimport_schema.parquet` when columns are removed, the order
   changes or it carries pandas metadata, and passes that file as `use_schema_file` (a stale schema brings removed
   columns back all-null);

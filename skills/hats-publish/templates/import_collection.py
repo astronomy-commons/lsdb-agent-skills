@@ -223,6 +223,12 @@ def reimport_columns(cfg, cat, source_schema) -> list[str] | None:
     if unknown:
         print(f"note: [columns].drop names columns the source does not have: {unknown}")
     names = [n for n in src if n not in HIVE_COLUMNS and n not in drop]
+    # the same names verify_structure.py fails a build for: a pandas index leaked into the files, or the pre-HATS
+    # spatial index. They carry no catalog data, but they are dropped only on an explicit decision ([columns].drop).
+    stray = [n for n in names if n == "_hipscat_index" or n.startswith("__index_level")]
+    if stray:
+        raise SystemExit(f"the source carries stray columns that verify_structure.py would fail: {stray}; check what they "
+                         "hold (a leaked pandas index is usually a row number) and add them to [columns].drop")
     if SPATIAL_INDEX_COLUMN in names:
         names = [SPATIAL_INDEX_COLUMN] + [n for n in names if n != SPATIAL_INDEX_COLUMN]
     return names
