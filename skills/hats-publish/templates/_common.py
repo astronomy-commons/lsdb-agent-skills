@@ -404,8 +404,39 @@ INPUT_FORMATS = ("fits", "csv", "tsv", "ecsv", "parquet", "indexed_csv", "indexe
 NON_DATA_SUFFIXES = (".sha256", ".html", ".log", ".md", ".txt", ".json", ".pid", ".sh")
 
 
-def input_files(cfg: Config) -> list[Path]:
+def reimport_source(cfg: Config):
+    """[run].reimport_from: the existing HATS catalog (or its collection root) that the reimport route repartitions.
+    A collection resolves to its main catalog (hats reads `hats_primary_table_url` from collection.properties)."""
+    import hats
+    from hats.catalog.catalog_collection import CatalogCollection
+
+    src = cfg["run"].get("reimport_from") or ""
+    if not src:
+        raise SystemExit("[run].route = \"reimport\" needs [run].reimport_from (an existing HATS catalog or collection)")
+    cat = hats.read_hats(src if "://" in src else cfg.path(src))   # a relative path is taken from the work directory
+    return cat.main_catalog if isinstance(cat, CatalogCollection) else cat
+
+
+def reimport_files(cat) -> list[str]:
+    """The partition files of a HATS catalog (dataset/Norder=*/Dir=*/Npix=*.parquet), sorted: the input of the
+    reimport route. Listed from the catalog's partition info, not by walking the directory."""
+    from hats.io.paths import pixel_catalog_file
+
+    suffix = cat.catalog_info.npix_suffix
+    out = []
+    for pixel in cat.get_healpix_pixels():
+        path = pixel_catalog_file(cat.catalog_base_dir, pixel, npix_suffix=suffix)
+        if suffix in ("/", "\\"):   # directory partitions: every data file inside
+            out += [str(f) for f in path.iterdir() if f.is_file() and not f.name.startswith((".", "_"))]
+        else:
+            out.append(str(path))
+    return sorted(out)
+
+
+def input_files(cfg: Config, *, reimport_partitions: bool = True) -> list[Path]:
     """The input files of a run: [source].files (paths or globs) or, when empty, every data file in the raw dir.
+    On route "reimport" with [source].files empty: the partition files of [run].reimport_from (what the import
+    reads; reimport_partitions=False keeps the raw-dir listing, for provenance lines).
     One helper for the estimate, the import and the verification so all three read the same files."""
     files: list[Path] = []
     for pattern in cfg["source"].get("files") or []:
@@ -414,6 +445,10 @@ def input_files(cfg: Config) -> list[Path]:
             files += sorted(Path(p) for p in glob.glob(str(full)))
         else:
             files.append(full)
+    if not files and reimport_partitions and cfg["run"].get("route") == "reimport" and not cfg["source"].get("files"):
+        from hats.io.file_io import get_upath
+
+        return [get_upath(f) if "://" in f else Path(f) for f in reimport_files(reimport_source(cfg))]
     if not files:
         files = sorted(p for p in cfg.raw_dir.glob("*") if p.is_file() and not p.name.endswith(NON_DATA_SUFFIXES))
     if not files:

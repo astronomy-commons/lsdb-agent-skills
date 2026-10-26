@@ -155,8 +155,8 @@ def source_file_lines(cfg) -> list[str]:
     digests = dict(src.get("sha256") or {})
     lines = []
     files = []
-    try:   # [source].files (globs expanded) or, when empty, the downloaded files in the raw directory
-        files = [Path(f) for f in input_files(cfg) if Path(f).is_file()]
+    try:   # [source].files (globs expanded) or, when empty, the downloaded files in the raw directory (also on route reimport)
+        files = [Path(f) for f in input_files(cfg, reimport_partitions=False) if Path(f).is_file()]
     except SystemExit:   # inputs not on this machine (e.g. documenting a copy): the recorded digests stand in
         files = []
     if files:

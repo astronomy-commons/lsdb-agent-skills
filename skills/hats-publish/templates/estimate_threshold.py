@@ -7,7 +7,9 @@ writer settings, measures the bytes per row on disk, and converts the target fil
 (rows per partition). MB here is 10^6 bytes ([partitioning].target_file_mb uses the same unit).
 
 The sample is read with the import's own reader chain (import_collection.file_reader: keep-list, column rules,
-string stripping, conform_schema), so the measured row width is that of the rows the import will write.
+string stripping, conform_schema), so the measured row width is that of the rows the import will write. On route
+"reimport" the sample is the partition files of [run].reimport_from read with the reimport reader (Parquet, the
+import's column list), whatever [source].files and [source].format say: those only redirect the verification.
 
 Usage:
     estimate_threshold.py [--config catalog.toml] [--sample-rows 200000] [--files N]
@@ -28,7 +30,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    check_versions, input_files, load_config, parquet_write_kwargs, pin_cpus, row_group_kwargs, runlog,
+    check_versions, input_files, load_config, parquet_write_kwargs, pin_cpus, reimport_files, reimport_source,
+    row_group_kwargs, runlog,
 )
 
 MB = 10**6   # file sizes in this script and in [partitioning].target_file_mb
@@ -37,10 +40,17 @@ MB = 10**6   # file sizes in this script and in [partitioning].target_file_mb
 def iter_source_chunks(cfg, files: list[Path], max_rows: int):
     """Yield pyarrow tables from the first input file(s) using the import's reader for the configured format (for
     the indexed formats `files` are index files, as the import reads them)."""
-    from import_collection import file_reader
-
     chunksize = min(int(cfg["reader"].get("chunksize", 500_000)), max_rows)
-    reader = file_reader(cfg, files, coordinate_filter=False, chunksize=chunksize)
+    if cfg["run"].get("route") == "reimport":   # the reader reimport_kwargs gives hats-import
+        from hats_import.catalog.file_readers.parquet import ParquetPyarrowReader
+
+        from import_collection import reimport_read_columns
+
+        reader = ParquetPyarrowReader(chunksize=chunksize, column_names=reimport_read_columns(cfg, reimport_source(cfg)))
+    else:
+        from import_collection import file_reader
+
+        reader = file_reader(cfg, files, coordinate_filter=False, chunksize=chunksize)
     got = 0
     for f in files:
         for chunk in reader.read(str(f)):
@@ -117,7 +127,10 @@ def main(argv=None) -> int:
     cfg = load_config(a.config)
     check_versions(cfg, warn_newer=not a.no_pypi)
     pin_cpus(cfg)   # one process, no Dask cluster: pinning is the only cap that applies
-    all_files = input_files(cfg)
+    reimport = cfg["run"].get("route") == "reimport"
+    # the files the import reads: on route "reimport" always the source's partition files ([source].files there
+    # only redirects the verification), otherwise [source].files or the raw dir
+    all_files = [Path(f) for f in reimport_files(reimport_source(cfg))] if reimport else input_files(cfg)
     step = max(1, len(all_files) // max(a.files, 1))
     files = all_files[::step][: a.files]   # spread over the inputs: sky-ordered files make the first ones unrepresentative
     tables = list(iter_source_chunks(cfg, files, a.sample_rows))
@@ -132,6 +145,8 @@ def main(argv=None) -> int:
     lo_rows, hi_rows = int(lo_mb * MB / bytes_per_row), int(hi_mb * MB / bytes_per_row)
     suggestion = int(round((lo_rows + hi_rows) / 2, -3)) or hi_rows
     total = a.total_rows or int(cfg["source"].get("expected_total_rows") or 0)
+    if not total and reimport:   # the import's fallback: the source's row count
+        total = int(reimport_source(cfg).catalog_info.total_rows or 0)
 
     print(f"sampled {len(sample):,} rows from {len(files)} file(s): {bytes_per_row:.1f} B/row on disk "
           f"({in_mem:.1f} B/row in memory, {sample.num_columns} columns)")

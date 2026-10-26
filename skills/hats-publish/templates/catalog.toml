@@ -19,7 +19,7 @@ expect_removed_rows = false         # (interview) true when this version REMOVES
 
 [source]
 urls = []                           # files to download into raw_dir (https only)
-files = []                          # or local files / globs already on disk; relative entries are taken from work_dir; indexed formats: the index files
+files = []                          # or local files / globs already on disk; relative entries are taken from work_dir; indexed formats: the index files; route "reimport": empty = verify against the reimport_from partition files
 format = "fits"                     # fits | csv | ecsv | parquet | indexed_csv | indexed_parquet
 data_model_url = ""                 # column description page, saved next to the data
 expected_files = 0                  # number of data files the archive publishes (indexed formats: files listed in the index files); 0 = unknown; the input-size pass refuses to start on a mismatch
@@ -160,6 +160,9 @@ all_pairs_max_rows = 20000000       # above this the margin test runs on a 1 M-r
 targets = ["web", "mirror"]         # the first target is the primary copy (hats_status main), the others are mirrors
 web_link_name = ""                  # "" -> names.public_name
 autoindex_description = ""          # "" -> properties.obs_title
+version = ""                        # (interview) short version label of this copy, e.g. a date "2026-10": the copy goes to
+                                    # <survey>/<collection>_<version> and <survey>/<collection> becomes a symlink to it;
+                                    # "" = legacy layout (the copy is written at <survey>/<collection> itself)
 
 [site]                              # (interview) data.lsdb.io page (see reference/publishing.md)
 group = "MySurvey"
@@ -167,7 +170,7 @@ name = "MySurvey DR1"
 display_name = "MySurvey DR1"
 id = "mysurvey_dr1"                 # permanent; lowercase letters, digits, underscores
 description = ""
-badges = []                         # (interview) page badges, e.g. a hosting-region label and "HTTP"
+badges = []                         # (interview) page badges as plain strings, e.g. ["US-West", "HTTP"] ({ title = "..." } tables also accepted)
 other_urls = [
   { label = "Official release", url = "" },
   { label = "Column descriptions", url = "" },

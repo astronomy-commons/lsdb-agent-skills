@@ -19,10 +19,37 @@ after approval. A destination that holds files the build does not have stops the
 differ, in `hats_status`, `hats_service_url` (each table's own directory URL on that copy) and the relative
 `hats_primary_table_url`.
 
+### Versioned layout
+
+With `[hosting].version` set (a short label, for example a date `2026-10`), each script copies into the versioned
+directory `<root>/<survey>/<collection>_<version>` and keeps the stable path `<root>/<survey>/<collection>` as a
+relative symlink to it. The symlink is created or re-pointed only after the copy, the checksums, the property
+stamping and (web) the public open test succeeded, so the stable path never serves a partial copy; it is replaced
+atomically (a new symlink renamed over the old one). Users, mirrors and `hats_service_url` address the stable path
+(the mirror) or the public URL (the web host), never a versioned directory. On the web host the public link
+`<HATS_PUBLISH_WEB_ROOT>/<name>` points at the versioned directory itself, so a failed open test reverts it, and the
+stable symlink with it, to the previous version. An empty `version` keeps the legacy layout: the copy is written
+at the stable path itself, which on a re-import overwrites the served copy file by file.
+
+`--check` and `--yes` read the stable path (on the data host for `web`, locally for `mirror`) before anything is
+written:
+
+| Stable path | What the script does |
+|---|---|
+| absent | copies, then creates the symlink |
+| a symlink | prints its target; copies, then re-points it; the previous target stays on disk and is printed as the copy to retire later |
+| a real directory (a legacy unversioned copy) | stops with exit 1 and prints the command that renames it to `<collection>_<label>` (label from its `hats_creation_date`, else its modification date) and leaves a symlink in its place, which keeps it served; run it, then run the script again. The scripts never rename or delete a served copy |
+| the versioned directory exists already | a resumed or repeated push of the same version: the existing-destination rules above apply (extras listed, `--replace` deletes them) |
+
+Both scripts also refuse to write when `[run].reimport_from` or the local collection resolves to the destination or
+lies inside it, and the legacy layout refuses a stable path that is already a symlink (it would write into the
+served version).
+
 ### Web host details
 
 The public URL `<HATS_PUBLISH_WEB_URL>/<name>` is a symlink in `<HATS_PUBLISH_WEB_ROOT>` pointing at the
-collection in the data store (as the data.lsdb.io README describes). The name may be nested in a group directory
+collection in the data store (as the data.lsdb.io README describes); in the versioned layout, at the versioned
+directory. The name may be nested in a group directory
 (`wise/allwise`): the script creates the group directory in the web tree if it is missing, and the data copy stays at
 `<survey>/<collection>`. The directory listing uses Apache's
 `AddDescription "<text>" <name> <name>/` lines in `.htaccess`; Apache takes the **first** matching line and matches
@@ -44,7 +71,9 @@ partner copies listed in `[registry].mirrors`. A copy left on the old version se
 under the same name. Write one checklist line per target in `NOTES.md` (target, path or URL, `hats_status` word,
 date refreshed, verification result) and close the run only when every line is ticked. `hats_status` is `main` on
 the primary copy and `mirror` on every other copy, and `hats_service_url` is each copy's own URL; the publish scripts
-set both, and a copy made by hand or by a partner needs them set by hand.
+set both, and a copy made by hand or by a partner needs them set by hand. In the versioned layout the stable symlink
+`<survey>/<collection>` is what mirrors, partners and users address; refreshing a copy means publishing the new
+version beside the old one and switching that symlink, never editing the served directory.
 
 ## The data.lsdb.io page
 
@@ -54,7 +83,8 @@ Repository: https://github.com/astronomy-commons/data.lsdb.io (`data/README.md` 
 `make_site_entry.py` writes `data/<Group>/<Name>/catalog.json` from `[site]`, renders `point_density.webp` from
 the local collection with the repository's own plotting call, fills `metadata` from the local properties, runs
 `scripts/update_index.py` (never edit `data/catalogs.json` by hand), and stages the files on a branch named after
-the page `id`. An existing entry is merged, not replaced: keys the script does not produce (column mean maps,
+the page `id` (a new branch starts from the fetched remote default branch, e.g. `origin/main`, not from the clone's
+current branch; without a remote, from HEAD). An existing entry is merged, not replaced: keys the script does not produce (column mean maps,
 extra URLs, notes, connectivity flags) are kept, and the changed keys are listed. The commit message is the user's; the pull request is the user's; nothing is pushed by the skill.
 
 Conventions seen across the existing entries:
@@ -93,7 +123,11 @@ clone, fails when the XML was not rendered, and shows the staged diff; the pull 
 ## Retiring a previous version
 
 Keep the old copy until the page and the registry point at the new one and users have had a notice period. Then
-remove the symlink first, the data second, and update the page notes.
+remove the previous versioned directory, the one the publish script printed as "previous version kept on disk"
+(on each target), and update the page notes. The stable symlink `<survey>/<collection>` and the web link are never
+removed: they already point at the new version. Check that nothing else points at the old directory (the web link,
+a mirror, `[run].reimport_from` of a run still in progress) before deleting it. In the legacy unversioned layout
+there is no old copy left to remove: the push overwrote it.
 
 ## Retiring a catalog
 

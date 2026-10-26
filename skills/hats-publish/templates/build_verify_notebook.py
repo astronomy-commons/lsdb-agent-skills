@@ -40,7 +40,8 @@ def build(cfg, collection: str, staging: str, public_url: str, templates_dir: st
     md(f"""# {cat_name} — source vs HATS verification
 
 **Ground truth:** the source files listed in `catalog.toml` (`[source]`), loaded with `catalog_source.load_source`,
-i.e. exactly as the small import route reads them. **Under test:** the collection at `{collection}`.
+i.e. exactly as the small import route reads them (route "reimport" without `[source].files`: the partition files of
+`[run].reimport_from`, read as the import reads them). **Under test:** the collection at `{collection}`.
 
 Rules: no tolerances. Every stored column must be exact (integers and strings equal, floats bit-equal with NaN
 matching NaN), the row set identical, and the spatial index, partitioning, skymap and margin must follow from the
@@ -114,7 +115,9 @@ print("values changed by stripping blank padding:", {k: v for k, v in meta["stri
 if meta["dropped"] or meta["renamed"] or meta["cast"]:
     print("column rules applied:", {k: meta[k] for k in ("dropped", "renamed", "cast")})
 recorded = cfg["source"].get("sha256") or {}
-if recorded:
+if meta.get("reimport_from"):
+    skip("1.source_sha256", "route reimport: the source is the partition files of [run].reimport_from, not the downloaded files")
+elif recorded:
     bad = []
     for f in meta["files"]:
         want = recorded.get(Path(f).name)

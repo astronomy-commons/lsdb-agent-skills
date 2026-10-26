@@ -207,7 +207,13 @@ The skill's reimport route (`route = "reimport"`, `reimport_from`) does the same
 - rewrites the source `_common_metadata` to `<work_dir>/reimport_schema.parquet` when columns are removed, the order
   changes or it carries pandas metadata, and passes that file as `use_schema_file` (a stale schema brings removed
   columns back all-null);
-- has no default columns to carry when the source has none: set `[columns].default` (`reference/decisions.md`).
+- has no default columns to carry when the source has none: set `[columns].default` (`reference/decisions.md`);
+- verifies against the source's partition files when `[source].files` is empty: `estimate_threshold.py` and the
+  value-level notebook read them as the import does (Parquet whatever `[source].format` says, no `Norder`/`Dir`/`Npix`,
+  no `[columns].drop`, the spatial index left out and recomputed from the positions). For a stronger check, point
+  `[source].files` and `[source].format` at the original raw files; the notebook then compares against those (FITS
+  sources need `[reader].strip_strings = true`, `reference/verification.md`), while the import and the estimate still
+  read the partition files.
 
 Trial of a catalog you hold only remotely or in part. `--trial-file` needs one partition file and the source's
 metadata, not the whole catalog. Build a mini-source: a catalog directory with the source's `properties`,

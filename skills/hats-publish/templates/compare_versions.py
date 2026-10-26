@@ -5,7 +5,9 @@
 What it reports:
   * schema: columns only in one side, columns with different Arrow types, each type change classified as a
     narrowing (same kind, fewer bits: double -> float, int64 -> int32), a widening, a sign change (int32 <-> uint32)
-    or a kind change (anything else);
+    or a kind change (anything else); string <-> large_string, binary <-> large_binary and list <-> large_list of the
+    same value type differ only in offset width (the reader decides it: pandas' pyarrow string dtype writes
+    large_string) and are reported as identical;
   * partitioning and writer: partition counts and orders, rows per partition, row groups, codec, page index,
     builder versions, default columns (old side: only the partitions that overlap the compared region);
   * rows: for the compared sky region, the number of rows on each side and the id sets (ids only in one side).
@@ -77,6 +79,16 @@ def _kind(t: pa.DataType) -> str | None:
     return None
 
 
+def offset_width_only(old: pa.DataType, new: pa.DataType) -> bool:
+    """True when the two types are the same logical type with 32- versus 64-bit offsets: string <-> large_string,
+    binary <-> large_binary, list <-> large_list of the same value type."""
+    if {old, new} in ({pa.string(), pa.large_string()}, {pa.binary(), pa.large_binary()}):
+        return True
+    if (pa.types.is_list(old) or pa.types.is_large_list(old)) and (pa.types.is_list(new) or pa.types.is_large_list(new)):
+        return old.value_type == new.value_type and pa.types.is_large_list(old) != pa.types.is_large_list(new)
+    return False
+
+
 def type_change(old: pa.DataType, new: pa.DataType) -> str:
     """How the type changed from the old to the new side: narrowing, widening, sign change or kind change."""
     ko, kn = _kind(old), _kind(new)
@@ -138,6 +150,16 @@ def partition_rows(main, pixels) -> dict:
     return {(p.order, p.pixel): n for p, n in zip(pixels, counts)}
 
 
+def table_props(main) -> dict:
+    """The table's properties by their file keys. extra_dict() holds only the keys TableProperties has no field for;
+    the fields used here (hats_cols_default, hats_max_rows, hats_col_healpix) are taken from the attributes."""
+    ci = main.catalog_info
+    cols = getattr(ci, "default_columns", None)
+    return ci.extra_dict() | {"hats_col_healpix": getattr(ci, "healpix_column", None),
+                              "hats_cols_default": " ".join(cols) if isinstance(cols, (list, tuple)) else cols,
+                              "hats_max_rows": getattr(ci, "hats_max_rows", None)}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--new", required=True)
@@ -176,7 +198,11 @@ def main(argv=None) -> int:
     s_new, s_old = schema_of(new_main), schema_of(old_main)
     only_new = sorted(set(s_new) - set(s_old)); only_old = sorted(set(s_old) - set(s_new))
     common = [c for c in s_new if c in s_old]
-    type_diff = {c: (str(s_old[c]), str(s_new[c]), type_change(s_old[c], s_new[c])) for c in common if s_old[c] != s_new[c]}
+    offset_only = sorted(c for c in common if s_old[c] != s_new[c] and offset_width_only(s_old[c], s_new[c]))
+    if offset_only:
+        print(f"offset width only (string <-> large_string and the like), treated as identical: {offset_only}")
+    type_diff = {c: (str(s_old[c]), str(s_new[c]), type_change(s_old[c], s_new[c]))
+                 for c in common if s_old[c] != s_new[c] and c not in offset_only}
     print(f"schema: {len(common)} common columns; only in new: {only_new}; only in old: {only_old}")
     for c, (o, n, change) in type_diff.items():
         print(f"  type differs {c}: old {o} -> new {n}  ({change})")
@@ -199,8 +225,7 @@ def main(argv=None) -> int:
         new_pixels = kept
     new_sel = new_cat.pixel_search(new_pixels)
 
-    new_props = new_main.catalog_info.extra_dict() | {"hats_col_healpix": getattr(new_main.catalog_info, "healpix_column", None)}
-    old_props = old_main.catalog_info.extra_dict() | {"hats_col_healpix": getattr(old_main.catalog_info, "healpix_column", None)}
+    new_props, old_props = table_props(new_main), table_props(old_main)
     keys = [k.strip() for k in a.key.split(",")]
     missing_keys = [k for k in keys if k not in s_new or k not in s_old]
     if missing_keys:

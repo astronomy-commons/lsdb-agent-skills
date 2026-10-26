@@ -102,7 +102,9 @@ Phases in order. **Bold** steps stop and wait for the user. Each phase starts an
    previews (what would be copied, and what the destination already holds), and only after the user's approval run
    them with `--yes` (without one of the two flags they stop; a destination that holds files the build lacks stops
    them before writing unless `--replace` is given, which deletes the stale files): copy, group, checksum manifest,
-   per-table `hats_status` and `hats_service_url`, symlink on the web host, public open test with
+   per-table `hats_status` and `hats_service_url` (with `[hosting].version` the copy goes to
+   `<collection>_<version>` and the stable `<collection>` path becomes a symlink to it, switched only after the
+   checks), symlink on the web host, public open test with
    `lsdb.open_catalog` on the collection root (a failure reverts the symlink), then the autoindex description; the
    mirror copy is re-verified into `verify_results_mirror.csv`.
 9. **Register.** `make_site_entry.py` writes the page entry and the density map on a branch in a data.lsdb.io clone

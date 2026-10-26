@@ -29,8 +29,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     apply_dask_resources, check_versions, first_listed_file, input_files, input_size_report,
-    load_config, pin_cpus, properties_dict, read_properties, row_group_kwargs, runlog, validate_properties,
-    writer_kwargs,
+    load_config, pin_cpus, properties_dict, read_properties, reimport_files, reimport_source, row_group_kwargs, runlog,
+    validate_properties, writer_kwargs,
 )
 
 
@@ -174,24 +174,6 @@ def catalog_kwargs(cfg, files: list[str]) -> dict:
     return kw
 
 
-def reimport_source(cfg):
-    """[run].reimport_from: the existing HATS catalog (or its collection root) that the reimport route repartitions."""
-    import hats
-    from hats.catalog.catalog_collection import CatalogCollection
-
-    src = cfg["run"].get("reimport_from") or ""
-    if not src:
-        raise SystemExit("[run].route = \"reimport\" needs [run].reimport_from (an existing HATS catalog or collection)")
-    cat = hats.read_hats(src if "://" in src else cfg.path(src))   # a relative path is taken from the work directory
-    return cat.main_catalog if isinstance(cat, CatalogCollection) else cat
-
-
-def reimport_files(cat) -> list[str]:
-    from hats.io.paths import DATASET_DIR, PARTITION_ORDER
-
-    return sorted(str(p) for p in (cat.catalog_base_dir / DATASET_DIR).rglob(f"{PARTITION_ORDER}*/**/*{cat.catalog_info.npix_suffix}"))
-
-
 def reimport_columns(cfg, cat, source_schema) -> list[str] | None:
     """The columns the reimport route reads and writes: the source schema without the hipscat-era partition columns
     (Norder, Dir, Npix) and without [columns].drop, the spatial index (_healpix_29) first and the rest in source
@@ -234,6 +216,24 @@ def reimport_columns(cfg, cat, source_schema) -> list[str] | None:
     return names
 
 
+def reimport_source_schema(cat):
+    """(path of the source's dataset/_common_metadata, its Arrow schema); without that file, hats' in-memory schema."""
+    import hats
+    from hats.io import file_io
+
+    schema_path = str(hats.io.paths.get_common_metadata_pointer(cat.catalog_base_dir))
+    try:
+        source_schema = file_io.read_parquet_metadata(schema_path).schema.to_arrow_schema()
+    except FileNotFoundError:
+        source_schema = cat.schema
+    return schema_path, source_schema
+
+
+def reimport_read_columns(cfg, cat) -> list[str] | None:
+    """The column list the reimport route's reader reads (reimport_columns on the source schema); None = all."""
+    return reimport_columns(cfg, cat, reimport_source_schema(cat)[1])
+
+
 def reimport_schema_file(cfg, source_path: str, source_schema, names) -> str:
     """The use_schema_file for the reimport route. hats-import's reduce step reads each pixel with this schema
     (pyarrow read_table(schema=...)): a column in the schema but not in the rows comes back all-null, and the
@@ -270,16 +270,10 @@ def reimport_kwargs(cfg, cat, files: list[str]) -> dict:
     Norder/Dir/Npix); `id` and `default` are written to the properties and must survive `drop`; `sort` is not applied
     (hats-import refuses sort columns together with use_healpix_29) but must survive `drop`; `rename` and `cast` are
     refused (the rows keep the source's names and types). Column order: _healpix_29 first, the rest in source order."""
-    import hats
-    from hats.io import file_io
     from hats_import.catalog.file_readers.parquet import ParquetPyarrowReader
 
     p = cfg["partitioning"]
-    schema_path = str(hats.io.paths.get_common_metadata_pointer(cat.catalog_base_dir))
-    try:
-        source_schema = file_io.read_parquet_metadata(schema_path).schema.to_arrow_schema()
-    except FileNotFoundError:
-        source_schema = cat.schema
+    schema_path, source_schema = reimport_source_schema(cat)
     names = reimport_columns(cfg, cat, source_schema)
     kw = {
         "catalog_type": cat.catalog_info.catalog_type,
