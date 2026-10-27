@@ -8,6 +8,8 @@ What it reports:
     or a kind change (anything else); string <-> large_string, binary <-> large_binary and list <-> large_list of the
     same value type differ only in offset width (the reader decides it: pandas' pyarrow string dtype writes
     large_string) and are reported as identical;
+    the hive-era Norder/Dir/Npix data columns, which the reimport route removes, are reported as identical when
+    they exist only on the old side;
   * partitioning and writer: partition counts and orders, rows per partition, row groups, codec, page index,
     builder versions, default columns (old side: only the partitions that overlap the compared region);
   * rows: for the compared sky region, the number of rows on each side and the id sets (ids only in one side).
@@ -197,6 +199,12 @@ def main(argv=None) -> int:
     old_main, old_cat = open_main(a.old)
     s_new, s_old = schema_of(new_main), schema_of(old_main)
     only_new = sorted(set(s_new) - set(s_old)); only_old = sorted(set(s_old) - set(s_new))
+    # the hive-era partition columns a re-import always removes (reference/import.md): their absence on the new side
+    # is the expected fix, not a schema difference
+    stray_removed = [c for c in only_old if c in ("Norder", "Dir", "Npix")]
+    if stray_removed:
+        print(f"hive-era columns removed by the re-import, treated as identical: {stray_removed}")
+        only_old = [c for c in only_old if c not in stray_removed]
     common = [c for c in s_new if c in s_old]
     offset_only = sorted(c for c in common if s_old[c] != s_new[c] and offset_width_only(s_old[c], s_new[c]))
     if offset_only:

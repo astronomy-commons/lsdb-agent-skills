@@ -19,6 +19,12 @@ after approval. A destination that holds files the build does not have stops the
 differ, in `hats_status`, `hats_service_url` (each table's own directory URL on that copy) and the relative
 `hats_primary_table_url`.
 
+Before the first write, and in `--check`, both scripts compare the free space of the destination filesystem (the
+deepest existing directory above the destination; on the data host for `web`) with 1.2 × the size of the build
+plus the reserve `HATS_PUBLISH_MIN_FREE_GB` (default 5000 GB). When it does not fit the script stops with nothing
+written, or, with `HATS_PUBLISH_WAIT_FOR_SPACE_MIN` set, polls every 10 minutes for up to that many minutes. A
+failed free-space probe is an error, never "enough space".
+
 ### Versioned layout
 
 With `[hosting].version` set (a short label, for example a date `2026-10`), each script copies into the versioned

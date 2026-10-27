@@ -249,7 +249,8 @@ if not UNIQUE_ID:
     # rows that share a key (duplicate positions) have no natural order on either side: give those rows only a
     # canonical tie key built from every scalar column, so identical rows line up and only real differences remain
     tie_cols = [c for c in df.columns if c not in sort_cols and c in hats_df.columns and c != "_key"
-                and not (len(df) and isinstance(df[c].iloc[0], (np.ndarray, list)))]
+                and not pa.types.is_nested(getattr(df[c].dtype, "pyarrow_dtype", None) or pa.null())   # Arrow lists / structs
+                and not (len(df) and isinstance(df[c].iloc[0], (np.ndarray, list, dict)))]
     for frame in (df, hats_df):
         dup = frame[KEY].duplicated(keep=False).to_numpy()
         frame["_tie"] = ""
@@ -263,12 +264,103 @@ if UNIQUE_ID:   # re-capture the keys in the sorted order (they were taken befor
     src_key = df[KEY].to_numpy(); hats_key = hats_df[KEY].to_numpy(dtype=src_key.dtype)
 assert len(df) == len(hats_df), f"row count differs after alignment: {len(df)} vs {len(hats_df)}"
 
+def _arrow_of(series):
+    """The Arrow array behind a pandas column, or None when it is numpy/object backed: pd.ArrowDtype columns, and
+    nested-pandas NestedDtype columns (lsdb's nested columns), whose struct_array is the struct-of-lists layout on disk."""
+    arr = getattr(series, "array", None)
+    if arr is None:
+        return None
+    if type(series.dtype).__name__ == "NestedDtype" and hasattr(arr, "struct_array"):
+        out = arr.struct_array
+    elif hasattr(arr, "_pa_array"):
+        out = arr._pa_array
+    else:
+        return None
+    return out.combine_chunks() if isinstance(out, pa.ChunkedArray) else out
+
+
 def _list_arrow(series):
     """Arrow list array of a pandas column holding lists (Arrow-backed, or object with arrays/lists)."""
-    arr = getattr(series, "array", None)
-    if arr is not None and hasattr(arr, "_pa_array"):
-        return pa.chunked_array(arr._pa_array).combine_chunks()
+    out = _arrow_of(series)
+    if out is not None:
+        return out
     return pa.array([None if v is None or (isinstance(v, float) and np.isnan(v)) else list(np.asarray(v).tolist()) for v in series.to_numpy(dtype=object)])
+
+
+def _is_struct(series):
+    """A struct column: pd.ArrowDtype(struct), nested-pandas NestedDtype, or an object column of dicts."""
+    t = getattr(series.dtype, "pyarrow_dtype", None)
+    if t is not None:
+        return pa.types.is_struct(t)
+    if series.dtype == object:
+        first = series.dropna()
+        return len(first) > 0 and isinstance(first.iloc[0], dict)
+    return False
+
+
+def _struct_arrow(series):
+    """Arrow struct array of a struct column (see _is_struct); dicts of numpy arrays are converted value by value."""
+    out = _arrow_of(series)
+    if out is not None:
+        return out
+    return pa.array([{k: (x.tolist() if isinstance(x, np.ndarray) else x) for k, x in v.items()} if isinstance(v, dict) else None
+                     for v in series.to_numpy(dtype=object)])
+
+
+def _is_list_type(t):
+    return pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t)
+
+
+def _list_bad_rows(la, lb):
+    """Boolean mask of the rows where two Arrow list arrays differ: in length (a null list counts as length -1) or
+    in any element (floats bit-equal with NaN matching NaN, other types equal with null matching null)."""
+    len_a, len_b = pc.fill_null(pc.list_value_length(la), -1), pc.fill_null(pc.list_value_length(lb), -1)
+    same_len = pc.equal(len_a, len_b).to_numpy(zero_copy_only=False)
+    bad_rows = ~same_len
+    if same_len.any():
+        sa, sb = la.filter(pa.array(same_len)), lb.filter(pa.array(same_len))
+        fa, fb = pc.list_flatten(sa), pc.list_flatten(sb)
+        eq = ~_values_bad_rows(fa, fb)
+        if (~eq).any():
+            parent = pc.list_parent_indices(sa).to_numpy(zero_copy_only=False)
+            bad_rows[np.flatnonzero(same_len)[np.unique(parent[~eq])]] = True
+    return bad_rows
+
+
+def _struct_bad_rows(sa, sb):
+    """Rows where two Arrow struct arrays differ, compared field by field: a row differs when it is null on one side
+    only or when any common field differs (pc.struct_field gives null fields for a null struct row). Returns the mask,
+    {field: mismatching rows} and the fields present on one side only (every non-null row then differs)."""
+    names_a, names_b = [f.name for f in sa.type], [f.name for f in sb.type]
+    valid_a = pc.is_valid(sa).to_numpy(zero_copy_only=False); valid_b = pc.is_valid(sb).to_numpy(zero_copy_only=False)
+    bad = valid_a != valid_b
+    per_field = {}
+    for f in names_a:
+        if f in names_b:
+            fbad = _values_bad_rows(pc.struct_field(sa, [names_a.index(f)]), pc.struct_field(sb, [names_b.index(f)]))
+            per_field[f] = int(fbad.sum())
+            bad |= fbad
+    only = sorted(set(names_a) ^ set(names_b))
+    if only:
+        bad |= valid_a | valid_b
+    return bad, per_field, only
+
+
+def _values_bad_rows(xa, xb):
+    """Boolean mask of the rows where two Arrow arrays of equal length differ: lists by length and elements, structs
+    field by field (recursively), floats bit-equal with NaN matching NaN, anything else equal with null matching null."""
+    ta, tb = xa.type, xb.type
+    if _is_list_type(ta) and _is_list_type(tb):
+        return _list_bad_rows(xa, xb)
+    if pa.types.is_struct(ta) and pa.types.is_struct(tb):
+        return _struct_bad_rows(xa, xb)[0]
+    if pa.types.is_nested(ta) or pa.types.is_nested(tb):   # list on one side, struct or scalar on the other
+        return np.ones(len(xa), dtype=bool)
+    if pa.types.is_floating(ta) or pa.types.is_floating(tb):
+        a = xa.to_numpy(zero_copy_only=False).astype(np.float64); b = xb.to_numpy(zero_copy_only=False).astype(np.float64)
+        return ~bit_equal(a, b)
+    both_null = pc.and_(pc.is_null(xa), pc.is_null(xb)).to_numpy(zero_copy_only=False)
+    return ~(pc.fill_null(pc.equal(xa, xb), False).to_numpy(zero_copy_only=False) | both_null)
 
 
 def bit_equal(a, b):
@@ -283,7 +375,22 @@ def bit_equal(a, b):
 
 
 def compare_column(name, a_series, b_series):
-    """a = source (numpy-backed), b = HATS (arrow-backed). n_mismatch == 0 means exact."""
+    """a = source (numpy-backed), b = HATS (arrow-backed). n_mismatch == 0 means exact (number of differing rows)."""
+    if _is_struct(a_series) or _is_struct(b_series):
+        # struct column (a nested column stored as struct<field: list<...>>, e.g. nested light curves): field by field,
+        # each field compared as its type (lists by length and elements); a row differs when any field differs
+        both = _is_struct(a_series) and _is_struct(b_series)
+        sa, sb = (_struct_arrow(a_series), _struct_arrow(b_series)) if both else (None, None)
+        if both:
+            bad, per_field, only = _struct_bad_rows(sa, sb)
+        else:
+            bad, per_field, only = np.ones(len(a_series), dtype=bool), {}, []
+        differ = {f: n for f, n in per_field.items() if n}
+        kind = "nested" if type(b_series.dtype).__name__ == "NestedDtype" else "struct"
+        return dict(column=name, source_dtype=f"struct[{len(sa.type)} fields]" if both else str(a_series.dtype),
+                    hats_dtype=(f"{kind}[{len(sb.type)} fields]" if both else str(b_series.dtype))
+                    + (f"; differing fields {differ}" if differ else "") + (f"; on one side only {only}" if only else ""),
+                    n_mismatch=int(bad.sum()), max_abs_diff=0.0, nan_source=0, nan_hats=0, null_hats=int(b_series.isna().sum()))
     a_type = getattr(a_series.dtype, "pyarrow_dtype", None)
     a_vals = a_series.to_numpy(dtype=object) if a_series.dtype == object else None
     is_arr = np.array([isinstance(v, (np.ndarray, list)) for v in a_vals]) if a_vals is not None else None
@@ -291,32 +398,17 @@ def compare_column(name, a_series, b_series):
     fixed_size = object_arrays and len({len(v) for v in a_vals[is_arr]}) == 1
     b_type = getattr(b_series.dtype, "pyarrow_dtype", None)
     b_is_list = b_type is not None and (pa.types.is_list(b_type) or pa.types.is_large_list(b_type) or pa.types.is_fixed_size_list(b_type))
-    if b_is_list and not object_arrays and (a_vals is None or pd.isna(a_series).all()):
+    if b_is_list and not object_arrays and bool(a_series.isna().all()):
         # a list column that is null in every sampled source row (a region without that band): HATS must be null too
         return dict(column=name, source_dtype="all null", hats_dtype=str(b_series.dtype), n_mismatch=int(b_series.notna().sum()),
                     max_abs_diff=0.0, nan_source=0, nan_hats=0, null_hats=int(b_series.isna().sum()))
     if (a_type is not None and (pa.types.is_list(a_type) or pa.types.is_large_list(a_type))) or (object_arrays and not fixed_size):   # variable-length lists
-        la, lb = _list_arrow(a_series), _list_arrow(b_series)
-        len_a, len_b = pc.fill_null(pc.list_value_length(la), -1), pc.fill_null(pc.list_value_length(lb), -1)
-        same_len = pc.equal(len_a, len_b).to_numpy(zero_copy_only=False)
-        bad_rows = ~same_len
-        if same_len.any():
-            sa, sb = la.filter(pa.array(same_len)), lb.filter(pa.array(same_len))
-            fa, fb = pc.list_flatten(sa), pc.list_flatten(sb)
-            if pa.types.is_floating(fa.type) or pa.types.is_floating(fb.type):
-                xa = fa.to_numpy(zero_copy_only=False).astype(np.float64); xb = fb.to_numpy(zero_copy_only=False).astype(np.float64)
-                eq = bit_equal(xa, xb)
-            else:
-                both_null = pc.and_(pc.is_null(fa), pc.is_null(fb)).to_numpy(zero_copy_only=False)
-                eq = pc.fill_null(pc.equal(fa, fb), False).to_numpy(zero_copy_only=False) | both_null
-            if (~eq).any():
-                parent = pc.list_parent_indices(sa).to_numpy(zero_copy_only=False)
-                bad_rows[np.flatnonzero(same_len)[np.unique(parent[~eq])]] = True
+        bad_rows = _list_bad_rows(_list_arrow(a_series), _list_arrow(b_series))
         return dict(column=name, source_dtype=str(a_series.dtype), hats_dtype=str(b_series.dtype), n_mismatch=int(bad_rows.sum()),
                     max_abs_diff=0.0, nan_source=0, nan_hats=0, null_hats=int(b_series.isna().sum()))
     if object_arrays and fixed_size:   # fixed-size array column (FITS TFORM nA); null rows must be null on both sides
         # through Arrow: pandas' to_numpy(object) fails on fixed-size-list columns that contain nulls
-        b_vals = _list_arrow(b_series).to_numpy(zero_copy_only=False) if hasattr(getattr(b_series, "array", None), "_pa_array") \
+        b_vals = _list_arrow(b_series).to_numpy(zero_copy_only=False) if _arrow_of(b_series) is not None \
             else b_series.to_numpy(dtype=object)
         b_arr = np.array([isinstance(v, (np.ndarray, list)) for v in b_vals])
         both = is_arr & b_arr
@@ -333,8 +425,8 @@ def compare_column(name, a_series, b_series):
     nulls_b = int(b_series.isna().sum())
     nan_a = nan_b = 0; maxdiff = 0.0
     if a.dtype == object:
-        if hasattr(getattr(b_series, "array", None), "_pa_array"):   # Arrow-backed: nulls -> "" without pandas' typed fill
-            b = np.array(["" if v is None else v for v in pa.chunked_array(b_series.array._pa_array).to_pylist()], dtype=object)
+        if _arrow_of(b_series) is not None:   # Arrow-backed: nulls -> "" without pandas' typed fill
+            b = np.array(["" if v is None else v for v in _arrow_of(b_series).to_pylist()], dtype=object)
         else:
             b = b_series.to_numpy(dtype=object, na_value="")
         a_cmp = np.where(pd.isna(a), "", a)

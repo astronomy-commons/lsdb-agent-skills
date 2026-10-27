@@ -39,6 +39,9 @@ the file.
 | `HATS_PUBLISH_MIRROR_ROOT` | local filesystem root of the mirror store | required for `mirror` |
 | `HATS_PUBLISH_MIRROR_URL` | base URL the mirror serves, if any | optional (empty = not served) |
 | `HATS_PUBLISH_MIRROR_GROUP` | unix group for the copied files | unset = leave as created |
+| **Free space** (`publish_web.sh`, `publish_mirror.sh`) | | |
+| `HATS_PUBLISH_MIN_FREE_GB` | reserve that must stay free on the destination filesystem after the copy: a publish needs 1.2 × the build size plus this many GB (10^9 bytes) free; `0` drops the reserve, not the 1.2 × the build | `5000` |
+| `HATS_PUBLISH_WAIT_FOR_SPACE_MIN` | with `--yes`, when the build does not fit, poll the free space every 10 minutes for up to this many minutes before stopping; `0` stops at once (`--check` never waits) | `0` |
 | **Batch jobs** | | |
 | `HATS_PUBLISH_SBATCH_OPTS` | account, partition and QOS options for `job.sbatch` | required to use the batch route |
 | `HATS_PUBLISH_TEMPLATES` | templates directory that `job.sbatch` pins from when `./templates.pinned` does not exist yet (`pin_templates.sh`); once it exists, every job runs the pinned copy | the submission directory |

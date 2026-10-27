@@ -21,6 +21,7 @@
 # copy and the files in it that the local collection does not have; --yes is required to write anything.
 # When the destination already holds files that the local collection does not have, --yes stops before writing
 # unless --replace is given, which deletes them (rsync --delete).
+# Free-space guard: before the first write and in --check, the destination needs 1.2 x build + HATS_PUBLISH_MIN_FREE_GB.
 set -euo pipefail
 
 CONFIG="catalog.toml"
@@ -192,6 +193,54 @@ report_stable() {   # prints the stable path state; sets BLOCKED for a state the
 }
 under() { [ "$1" = "$2" ] || [ "${1#"$2"/}" != "$1" ]; }   # $1 is $2 or inside it
 
+# ---- destination free space: 1.2 x the build plus a reserve, checked before the first write --------------------
+MIN_FREE_GB="${HATS_PUBLISH_MIN_FREE_GB:-5000}"
+WAIT_MIN="${HATS_PUBLISH_WAIT_FOR_SPACE_MIN:-0}"
+[[ "$MIN_FREE_GB" =~ ^[0-9]{1,9}$ ]] || { echo "HATS_PUBLISH_MIN_FREE_GB must be a whole number of GB: '$MIN_FREE_GB'" >&2; exit 2; }
+[[ "$WAIT_MIN" =~ ^[0-9]{1,9}$ ]] || { echo "HATS_PUBLISH_WAIT_FOR_SPACE_MIN must be a whole number of minutes: '$WAIT_MIN'" >&2; exit 2; }
+# arg: destination. Prints its deepest existing ancestor and the free bytes of that filesystem.
+read -r -d '' FREE_SH <<'SH' || true
+set -o pipefail
+p=$1
+while [ ! -d "$p" ]; do p=$(dirname "$p"); done
+printf '%s\n' "$p"
+df -B1 --output=avail "$p" | tail -1
+SH
+gb() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1e9 }'; }
+SPACE_AT=""; SPACE_FREE=""
+free_bytes() {   # sets SPACE_AT and SPACE_FREE for the destination; a failed probe is an error, not "enough space"
+  local out rc=0
+  out="$(bash -c "$FREE_SH" free "$DEST" 2>&1)" || rc=$?
+  SPACE_AT="$(head -n 1 <<< "$out")"; SPACE_FREE="$(sed -n '2p' <<< "$out" | tr -d ' ')"
+  { [ "$rc" -eq 0 ] && [[ "$SPACE_FREE" =~ ^[0-9]+$ ]]; } \
+    || { echo "cannot read the free space for $DEST (exit $rc):" >&2; echo "$out" >&2; exit 1; }
+}
+space_guard() {   # $1 = check | wait; prints the free-space line; returns 1 when the build does not fit
+  local size need deadline left
+  size="$(du -sb "$SRC" | cut -f1)"
+  [[ "$size" =~ ^[0-9]+$ ]] || { echo "cannot measure the size of $SRC" >&2; exit 1; }
+  need=$(( size * 12 / 10 + MIN_FREE_GB * 1000000000 ))
+  free_bytes
+  if [ "$SPACE_FREE" -lt "$need" ] && [ "$1" = wait ] && [ "$WAIT_MIN" -gt 0 ]; then
+    echo "waiting for space: free $(gb "$SPACE_FREE") GB < need $(gb "$need") GB; polling every 10 min for up to $WAIT_MIN min"
+    deadline=$(( $(date +%s) + WAIT_MIN * 60 ))
+    while [ "$SPACE_FREE" -lt "$need" ]; do
+      left=$(( deadline - $(date +%s) ))
+      [ "$left" -gt 0 ] || break
+      sleep $(( left < 600 ? left : 600 ))
+      free_bytes
+      echo "  $(date +%H:%M) free $(gb "$SPACE_FREE") GB"
+    done
+  fi
+  if [ "$SPACE_FREE" -ge "$need" ]; then
+    echo "free space: $(gb "$SPACE_FREE") GB on $SPACE_AT, need $(gb "$need") GB" \
+         "(1.2 x build $(gb "$size") GB + reserve $MIN_FREE_GB GB): ok"
+    return 0
+  fi
+  echo "insufficient space on $SPACE_AT: free $(gb "$SPACE_FREE") GB, need $(gb "$need") GB; nothing was written" >&2
+  return 1
+}
+
 if [ "$CHECK" -eq 0 ] && [ "$YES" -eq 0 ]; then
   echo "This writes to shared storage. Run with --check to preview, then with --yes after the user has approved." >&2
   exit 2
@@ -228,6 +277,8 @@ if [ -n "$REIMPORT_FROM" ]; then
          "stays on disk as the previous version"
   fi
 fi
+SPACE_OK=1
+if [ "$CHECK" -eq 1 ]; then space_guard check || SPACE_OK=0; fi
 [ "$BLOCKED" -eq 0 ] || { echo "nothing was written" >&2; exit 1; }
 
 RSYNC=(rsync -a --chmod=D2775,F664)
@@ -259,6 +310,7 @@ if [ "$CHECK" -eq 1 ]; then
   fi
   linked=1; [ -z "$VERSION" ] || { [ "$STABLE_STATE" = "symlink" ] && [ "$STABLE_TARGET" = "$DEST_REAL" ]; } || linked=0
   [ "$n" = "0" ] && [ "$EXTRA_N" = "0" ] && [ -d "$DEST" ] && [ "$linked" = 1 ] && echo "nothing to do"
+  [ "$SPACE_OK" -eq 1 ] || exit 1
   exit 0
 fi
 
@@ -272,6 +324,8 @@ if [ "$EXTRA_N" -gt 0 ]; then
   fi
   DELETE=(--delete); echo "--replace: $EXTRA_N files on the copy that the local collection does not have will be deleted"
 fi
+
+space_guard wait || exit 1
 
 step "a. rsync $SRC -> $DEST"
 # a new survey directory gets the same mode (and group) as the copies, not the login umask

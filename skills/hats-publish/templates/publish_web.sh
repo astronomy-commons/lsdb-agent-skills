@@ -29,6 +29,7 @@
 # legacy unversioned copy) stops the script with the rename to run first: the script never renames or deletes a
 # served copy. Both layouts refuse to write when [run].reimport_from or the local collection is the destination or
 # inside it (a comparison of paths, meaningful when the data store is mounted on this machine too).
+# Free-space guard: before the first write and in --check, the destination needs 1.2 x build + HATS_PUBLISH_MIN_FREE_GB.
 set -euo pipefail
 
 CONFIG="catalog.toml"
@@ -281,6 +282,54 @@ report_stable() {   # prints the stable path state; sets BLOCKED for a state the
   return 0
 }
 under() { [ "$1" = "$2" ] || [ "${1#"$2"/}" != "$1" ]; }   # $1 is $2 or inside it
+
+# ---- destination free space: 1.2 x the build plus a reserve, checked before the first write --------------------
+MIN_FREE_GB="${HATS_PUBLISH_MIN_FREE_GB:-5000}"
+WAIT_MIN="${HATS_PUBLISH_WAIT_FOR_SPACE_MIN:-0}"
+[[ "$MIN_FREE_GB" =~ ^[0-9]{1,9}$ ]] || { echo "HATS_PUBLISH_MIN_FREE_GB must be a whole number of GB: '$MIN_FREE_GB'" >&2; exit 2; }
+[[ "$WAIT_MIN" =~ ^[0-9]{1,9}$ ]] || { echo "HATS_PUBLISH_WAIT_FOR_SPACE_MIN must be a whole number of minutes: '$WAIT_MIN'" >&2; exit 2; }
+# arg: destination. Prints its deepest existing ancestor and the free bytes of that filesystem.
+read -r -d '' FREE_SH <<'SH' || true
+set -o pipefail
+p=$1
+while [ ! -d "$p" ]; do p=$(dirname "$p"); done
+printf '%s\n' "$p"
+df -B1 --output=avail "$p" | tail -1
+SH
+gb() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1e9 }'; }
+SPACE_AT=""; SPACE_FREE=""
+free_bytes() {   # sets SPACE_AT and SPACE_FREE on the data host; a failed ssh is an error, not "enough space"
+  local out rc=0
+  out="$($SSH "$DATA_HOST" "bash -s -- '$DEST'" <<< "$FREE_SH" 2> "$ERR")" || rc=$?
+  SPACE_AT="$DATA_HOST:$(head -n 1 <<< "$out")"; SPACE_FREE="$(sed -n '2p' <<< "$out" | tr -d ' ')"
+  { [ "$rc" -eq 0 ] && [[ "$SPACE_FREE" =~ ^[0-9]+$ ]]; } \
+    || { echo "cannot read the free space for $DATA_HOST:$DEST (ssh exit $rc):" >&2; echo "$out" >&2; cat "$ERR" >&2; exit 1; }
+}
+space_guard() {   # $1 = check | wait; prints the free-space line; returns 1 when the build does not fit
+  local size need deadline left
+  size="$(du -sb "$SRC" | cut -f1)"
+  [[ "$size" =~ ^[0-9]+$ ]] || { echo "cannot measure the size of $SRC" >&2; exit 1; }
+  need=$(( size * 12 / 10 + MIN_FREE_GB * 1000000000 ))
+  free_bytes
+  if [ "$SPACE_FREE" -lt "$need" ] && [ "$1" = wait ] && [ "$WAIT_MIN" -gt 0 ]; then
+    echo "waiting for space: free $(gb "$SPACE_FREE") GB < need $(gb "$need") GB; polling every 10 min for up to $WAIT_MIN min"
+    deadline=$(( $(date +%s) + WAIT_MIN * 60 ))
+    while [ "$SPACE_FREE" -lt "$need" ]; do
+      left=$(( deadline - $(date +%s) ))
+      [ "$left" -gt 0 ] || break
+      sleep $(( left < 600 ? left : 600 ))
+      free_bytes
+      echo "  $(date +%H:%M) free $(gb "$SPACE_FREE") GB"
+    done
+  fi
+  if [ "$SPACE_FREE" -ge "$need" ]; then
+    echo "free space: $(gb "$SPACE_FREE") GB on $SPACE_AT, need $(gb "$need") GB" \
+         "(1.2 x build $(gb "$size") GB + reserve $MIN_FREE_GB GB): ok"
+    return 0
+  fi
+  echo "insufficient space on $SPACE_AT: free $(gb "$SPACE_FREE") GB, need $(gb "$need") GB; nothing was written" >&2
+  return 1
+}
 switch_stable() {   # $1 = target name in the survey directory, empty = remove the stable symlink
   $SSH "$DATA_HOST" "bash -s -- '$SURVEY_DIR' '$COLLECTION' '$1' '$WEB_GROUP'" <<< "$SWITCH_SH"
 }
@@ -331,6 +380,8 @@ if [ -n "$REIMPORT_FROM" ] && [ "$STABLE_STATE" = "symlink" ] && under "$(realpa
   echo "note: [run].reimport_from is the copy the stable path serves now ($STABLE_TARGET); it is not written and" \
        "stays on disk as the previous version"
 fi
+SPACE_OK=1
+if [ "$CHECK" -eq 1 ]; then space_guard check || SPACE_OK=0; fi
 [ "$BLOCKED" -eq 0 ] || { echo "nothing was written" >&2; exit 1; }
 
 # the files of the existing copy that the local collection does not have (rsync without --delete keeps them)
@@ -367,6 +418,7 @@ if [ "$CHECK" -eq 1 ]; then
   linked=1; [ "$LINK_NOW" = "$DEST_ON_WEB" ] || linked=0
   if [ -n "$VERSION" ] && { [ "$STABLE_STATE" != "symlink" ] || [ "$STABLE_TARGET" != "$DEST_REAL" ]; }; then linked=0; fi
   if [ "$n" = "0" ] && [ "$EXTRA_N" = "0" ] && [ "$code" = "200" ] && [ "$linked" = 1 ]; then echo "nothing to do"; fi
+  [ "$SPACE_OK" -eq 1 ] || exit 1
   exit 0
 fi
 
@@ -380,6 +432,8 @@ if [ "$EXTRA_N" -gt 0 ]; then
   fi
   DELETE=(--delete); echo "--replace: $EXTRA_N files on the copy that the local collection does not have will be deleted"
 fi
+
+space_guard wait || exit 1
 
 step "a. rsync $SRC -> $DATA_HOST:$DEST"
 # a new survey directory gets the same mode (and group) as the copies, not the login umask

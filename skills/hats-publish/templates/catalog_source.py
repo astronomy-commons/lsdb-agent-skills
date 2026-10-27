@@ -2,7 +2,7 @@
 verification, so the comparison is against exactly what was imported.
 
 `load_source(cfg, files=None, max_rows=None)` returns:
-    df            pandas DataFrame, numpy-backed, with [columns].drop / rename / cast applied and, when
+    df            pandas DataFrame, numpy-backed (Parquet list and struct columns Arrow-backed), with [columns].drop / rename / cast applied and, when
                   [reader].strip_strings is set, leading and trailing blanks stripped from string columns (counts of
                   changed values in meta["strip_changed"])
     schema_expect list of (column, pyarrow.DataType) in order: what the HATS files must store
@@ -174,7 +174,7 @@ def _read_fits(p, hdu: int, max_rows: int | None):
 
 
 def _read_parquet(paths, keep, max_rows):
-    """Parquet files -> (frames, [(column, Arrow type)]), list columns kept Arrow-backed; stops after max_rows."""
+    """Parquet files -> (frames, [(column, Arrow type)]), list and struct columns kept Arrow-backed; stops after max_rows."""
     import pyarrow.parquet as pq
 
     frames, schema_expect = [], None
@@ -183,8 +183,9 @@ def _read_parquet(paths, keep, max_rows):
         if schema_expect is None:
             schema_expect = [(f.name, f.type) for f in t.schema]
         frame = t.to_pandas()
-        for f in t.schema:   # keep list columns Arrow-backed (to_pandas would give object arrays of ndarrays)
-            if pa.types.is_list(f.type) or pa.types.is_large_list(f.type):
+        for f in t.schema:   # keep list and struct (nested) columns Arrow-backed: to_pandas would give object arrays of
+            # ndarrays, or of dicts of ndarrays, which the value comparison cannot compare element by element
+            if pa.types.is_list(f.type) or pa.types.is_large_list(f.type) or pa.types.is_struct(f.type):
                 frame[f.name] = pd.array(t.column(f.name).combine_chunks(), dtype=pd.ArrowDtype(f.type))
         frames.append(frame)
         if max_rows and sum(len(f) for f in frames) >= max_rows:
