@@ -110,7 +110,7 @@ import sys
 from pathlib import Path
 root, catalog, status, base = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 def rewrite(path, props):
-    lines = path.read_text().splitlines(); seen = set(); out = []
+    lines = path.read_text(encoding="utf-8").splitlines(); seen = set(); out = []
     for line in lines:
         if "=" in line and not line.startswith("#"):
             key = line.split("=", 1)[0]
@@ -118,7 +118,7 @@ def rewrite(path, props):
                 out.append(f"{key}={props[key]}"); seen.add(key); continue
         out.append(line)
     out += [f"{k}={v}" for k, v in props.items() if k not in seen]
-    path.write_text("\n".join(out) + "\n")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
 tables = [p for p in sorted(root.iterdir()) if p.is_dir() and ((p / "properties").exists() or (p / "hats.properties").exists())]
 changed = 0
 for table in tables:
@@ -128,7 +128,7 @@ for table in tables:
     for f in (table / "hats.properties", table / "properties"):
         if not f.exists():
             continue
-        text = f.read_text()
+        text = f.read_text(encoding="utf-8")
         p = dict(props)
         if table.name != catalog and "hats_primary_table_url=" in text:
             p["hats_primary_table_url"] = f"../{catalog}"
@@ -150,7 +150,7 @@ if not desc or "\\" in desc:
     sys.exit(f"refusing autoindex description {desc!r}: empty or contains a backslash")
 desc = desc.replace('"', '\\"')
 new = f'AddDescription "{desc}" {link} {link}/'
-raw = path.read_text() if path.exists() else ""
+raw = path.read_text(encoding="utf-8") if path.exists() else ""
 old = raw.splitlines()
 def entry_name(line):
     # both forms seen in hand-written files: `AddDescription "text" name` and `AddDescription "text" name name/`
@@ -177,13 +177,13 @@ else:
 if check:
     print(f"would {action}: {new}"); sys.exit(0)
 try:
-    path.with_name(path.name + ".bak").write_text(raw)   # best-effort backup
+    path.with_name(path.name + ".bak").write_text(raw, encoding="utf-8")   # best-effort backup
 except OSError:
     pass
 text = "\n".join(lines) + "\n"
-path.write_text(text)          # truncate and rewrite in place: the directory is sticky, renames fail
-if path.read_text() != text:
-    path.write_text(raw)       # put the previous content back
+path.write_text(text, encoding="utf-8")          # truncate and rewrite in place: the directory is sticky, renames fail
+if path.read_text(encoding="utf-8") != text:
+    path.write_text(raw, encoding="utf-8")       # put the previous content back
     sys.exit("unexpected .htaccess content after writing: previous content restored")
 print(f"{action}: {new}")
 PY
@@ -411,7 +411,7 @@ if [ "$CHECK" -eq 1 ]; then
     echo "copy absent"
   fi
   step "check: autoindex description"
-  $SSH "$WEB_HOST" "python3 - '$HATS_PUBLISH_WEB_ROOT/.htaccess' '$LINK_B64' '$DESC_B64' 1" <<< "$HTACCESS_PY"
+  $SSH "$WEB_HOST" "PYTHONIOENCODING=utf-8 python3 - '$HATS_PUBLISH_WEB_ROOT/.htaccess' '$LINK_B64' '$DESC_B64' 1" <<< "$HTACCESS_PY"
   step "check: public URL"
   code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 30 "$PUBLIC/collection.properties" || echo 000)
   echo "$PUBLIC/collection.properties -> HTTP $code"
@@ -523,7 +523,7 @@ elif [ "$rc" -ne 0 ]; then
 fi
 
 step "g. autoindex description"
-$SSH "$WEB_HOST" "python3 - '$HATS_PUBLISH_WEB_ROOT/.htaccess' '$LINK_B64' '$DESC_B64' 0" <<< "$HTACCESS_PY"
+$SSH "$WEB_HOST" "PYTHONIOENCODING=utf-8 python3 - '$HATS_PUBLISH_WEB_ROOT/.htaccess' '$LINK_B64' '$DESC_B64' 0" <<< "$HTACCESS_PY"
 log "published at $PUBLIC"
 echo
 echo "published: $PUBLIC"
